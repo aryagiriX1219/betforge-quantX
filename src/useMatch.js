@@ -117,7 +117,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
     // Load initial state
     supabase.from('match_state').select('state').eq('id', MATCH_ROW_ID).single()
       .then(({ data, error }) => {
-        if (data?.state) {
+        if (data?.state && data.state.score) {
           const s = data.state
           setGs(s)
           recalcOdds(s)
