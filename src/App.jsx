@@ -25,6 +25,7 @@ export default function App() {
         adminAddStoppage={match.adminAddStoppage}
         adminVoidMarket={match.adminVoidMarket}
         adminInjectEvent={match.adminInjectEvent}
+        adminResolveSetpiece={match.adminResolveSetpiece}
         onSwitchToPlayer={() => setView('player')}
       />
     )
