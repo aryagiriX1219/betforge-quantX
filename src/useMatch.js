@@ -4,283 +4,243 @@ import { calcAllOdds, fmt } from './math'
 import { simulateMinute, resolveFreekick, resolveCorner, resolvePenalty, calcSetPieceOdds } from './engine'
 import { supabase } from './supabase'
 
-// ─── MATCH STATE ROW ID (single row in Supabase) ──────────────────────────────
 const MATCH_ROW_ID = 1
+let _nid = 0
+const mkN = (msg, type = 'tick') => ({ id: _nid++, msg, type, ts: Date.now() })
 
-let _notifId = 0
-function mkNotif(msg, type = 'tick') {
-  return { id: _notifId++, msg, type, ts: Date.now() }
-}
-
+// ─── INITIAL STATE ────────────────────────────────────────────────────────────
 function makeInitialMatchState() {
   const lambdaP = (TEAMS.portugal.strength * TEAMS.portugal.homeAdv) / 90
   const lambdaA = (TEAMS.argentina.strength * TEAMS.argentina.homeAdv) / 90
   return {
-    minute:       0,
-    score:        { P: 0, A: 0 },
-    lambdaP,
-    lambdaA,
-    status:       'prematch',
-    paused:       false,
-    events:       [],
-    redCards:     { portugal: 0, argentina: 0 },
-    yellowCards:  { portugal: 0, argentina: 0 },
+    minute: 0, score: { P: 0, A: 0 }, lambdaP, lambdaA,
+    status: 'prematch', paused: false, events: [],
+    redCards: { portugal: 0, argentina: 0 },
+    yellowCards: { portugal: 0, argentina: 0 },
     halfStoppage: { first: 0, second: 0 },
-    phase:        'first',
-    setpiece:     null,
-    notifications: [{ id: 0, msg: '🏟️ Welcome to BetForge! Portugal vs Argentina. Admin presses KICK OFF to begin.', type: 'system', ts: Date.now() }],
+    phase: 'first', setpiece: null,
+    notifications: [{ id: 0, msg: '🏟️ Welcome to BetForge! Portugal vs Argentina.', type: 'system', ts: Date.now() }],
   }
 }
 
-// ─── PUSH MATCH STATE TO SUPABASE (admin only) ───────────────────────────────
+// ─── SUPABASE HELPERS ─────────────────────────────────────────────────────────
 async function pushMatchState(state) {
   try {
-    await supabase.from('match_state').upsert({
-      id: MATCH_ROW_ID,
-      state: state,
-      updated_at: new Date().toISOString(),
-    })
-  } catch (e) {
-    console.error('Supabase push error:', e)
-  }
+    await supabase.from('match_state').upsert({ id: MATCH_ROW_ID, state, updated_at: new Date().toISOString() })
+  } catch (e) { console.error('push error:', e) }
 }
 
-// ─── SAVE BET TO SUPABASE ─────────────────────────────────────────────────────
 async function saveBet(userId, userName, bet) {
   try {
     await supabase.from('bets').upsert({
-      id: `${userId}_${bet.id}`,
-      user_id: userId,
-      user_name: userName,
-      market: bet.market,
-      selection: bet.selection,
-      stake: bet.stake,
-      odds: bet.odds,
-      status: bet.status,
-      potential: bet.stake * bet.odds,
+      id: `${userId}_${bet.id}`, user_id: userId, user_name: userName,
+      market: bet.market, selection: bet.selection, stake: bet.stake,
+      odds: bet.odds, status: bet.status, potential: bet.stake * bet.odds,
       updated_at: new Date().toISOString(),
     })
-  } catch (e) {
-    console.error('Supabase bet save error:', e)
-  }
+  } catch (e) { console.error('bet save error:', e) }
 }
 
-// ─── SAVE FINAL BALANCE TO LEADERBOARD ───────────────────────────────────────
 async function saveLeaderboard(userId, userName, balance, betsCount) {
   try {
     await supabase.from('leaderboard').upsert({
-      user_id: userId,
-      user_name: userName,
+      user_id: userId, user_name: userName,
       balance: Math.round(balance),
       pnl: Math.round(balance - INITIAL_BALANCE),
       bets_count: betsCount,
       updated_at: new Date().toISOString(),
     })
-  } catch (e) {
-    console.error('Supabase leaderboard error:', e)
-  }
+  } catch (e) { console.error('lb error:', e) }
 }
 
 // ─── HOOK ─────────────────────────────────────────────────────────────────────
 export function useMatch(currentUser = null, isAdmin = false) {
-  const [gs, setGs]             = useState(makeInitialMatchState)
-  const [bets, setBets]         = useState([])
-  const [balance, setBalance]   = useState(INITIAL_BALANCE)
-  const [notifications, setNotifications] = useState([
-    mkNotif('🏟️ Welcome to BetForge! Portugal vs Argentina.', 'system'),
-  ])
-  const [odds, setOdds]         = useState(null)
-  const [betSlip, setBetSlip]   = useState(null)
-  const [stakeInput, setStakeInput] = useState('100')
-  const [spTimer, setSpTimer]   = useState(0)
-  const [connected, setConnected] = useState(false)
+  const [gs, setGs]                   = useState(makeInitialMatchState)
+  const [bets, setBets]               = useState([])
+  const [balance, setBalance]         = useState(INITIAL_BALANCE)
+  const [notifications, setNotifs]    = useState([mkN('🏟️ Welcome! Portugal vs Argentina.', 'system')])
+  const [odds, setOdds]               = useState(null)
+  const [betSlip, setBetSlip]         = useState(null)
+  const [stakeInput, setStakeInput]   = useState('100')
+  const [spTimer, setSpTimer]         = useState(0)
+  const [connected, setConnected]     = useState(false)
 
-  const timerRef  = useRef(null)
-  const gsRef     = useRef(gs);      gsRef.current   = gs
-  const betsRef   = useRef(bets);    betsRef.current = bets
-  const balRef    = useRef(balance); balRef.current  = balance
+  const timerRef   = useRef(null)
+  const gsRef      = useRef(gs);      gsRef.current   = gs
+  const betsRef    = useRef(bets);    betsRef.current = bets
+  const balRef     = useRef(balance); balRef.current  = balance
   const isAdminRef = useRef(isAdmin); isAdminRef.current = isAdmin
 
-  // ── Push notification (local only — notifications come from match state) ──
   const pushNotif = useCallback((msg, type = 'tick') => {
-    const n = mkNotif(msg, type)
-    setNotifications(prev => [n, ...prev].slice(0, 80))
-    return n
+    setNotifs(prev => [mkN(msg, type), ...prev].slice(0, 80))
   }, [])
 
   const recalcOdds = useCallback((state) => {
+    if (!state?.score) return
     setOdds(calcAllOdds(state.score, state.minute, state.lambdaP, state.lambdaA))
   }, [])
 
-  // ── Subscribe to Supabase Realtime (ALL clients including admin) ──────────
+  // ── Supabase: load initial state + subscribe ──────────────────────────────
   useEffect(() => {
-    // Load initial state
     supabase.from('match_state').select('state').eq('id', MATCH_ROW_ID).single()
-      .then(({ data, error }) => {
-        const s = (data?.state?.score) ? data.state : makeInitialMatchState()
+      .then(({ data }) => {
+        // Guard: only use server state if it has a valid score object
+        const s = data?.state?.score ? data.state : makeInitialMatchState()
         setGs(s)
         recalcOdds(s)
         if (s.notifications?.length) {
-          setNotifications(s.notifications.slice(0, 80).map(n => ({ ...n, id: _notifId++ })))
+          setNotifs(s.notifications.slice(0, 80).map(n => ({ ...n, id: _nid++ })))
         }
         setConnected(true)
       })
+      .catch(() => {
+        // Supabase unreachable — fall back to local state gracefully
+        setConnected(false)
+      })
 
-    // Subscribe to live changes
     const channel = supabase
       .channel('match_state_changes')
       .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'match_state',
+        event: '*', schema: 'public', table: 'match_state',
         filter: `id=eq.${MATCH_ROW_ID}`,
       }, (payload) => {
-        if (!payload.new?.state) return
-        const s = payload.new.state
-        // Non-admin: update everything from server
-        if (!isAdminRef.current) {
-          setGs(s)
-          recalcOdds(s)
-          if (s.notifications?.length) {
-            setNotifications(s.notifications.slice(0, 80).map(n => ({ ...n, id: _notifId++ })))
-          }
+        const s = payload.new?.state
+        if (!s?.score) return
+        // ALL clients (including admin) sync from server on change
+        setGs(s)
+        recalcOdds(s)
+        if (s.notifications?.length) {
+          setNotifs(s.notifications.slice(0, 80).map(n => ({ ...n, id: _nid++ })))
         }
       })
-      .subscribe((status) => {
-        setConnected(status === 'SUBSCRIBED')
-      })
+      .subscribe((status) => setConnected(status === 'SUBSCRIBED'))
 
-    return () => { supabase.removeChannel(channel) }
+    return () => supabase.removeChannel(channel)
   }, [recalcOdds])
 
-  // ── Load user's own bets from Supabase on mount ───────────────────────────
+  // ── Load user's bets from Supabase ────────────────────────────────────────
   useEffect(() => {
     if (!currentUser) return
     supabase.from('bets').select('*').eq('user_id', currentUser.id)
       .then(({ data }) => {
-        if (data?.length) {
-          setBets(data.map(b => ({
-            id: b.id, market: b.market, selection: b.selection,
-            stake: b.stake, odds: b.odds, status: b.status,
-            label: `${b.market.toUpperCase()} — ${b.selection}`,
-          })))
-          // Recalculate balance from bets
-          const won = data.filter(b => b.status === 'won').reduce((s, b) => s + b.stake * b.odds, 0)
-          const spent = data.reduce((s, b) => s + (b.status !== 'void' ? b.stake : 0), 0)
-          setBalance(INITIAL_BALANCE - spent + won)
-        }
+        if (!data?.length) return
+        setBets(data.map(b => ({
+          id: b.id, market: b.market, selection: b.selection,
+          stake: b.stake, odds: b.odds, status: b.status,
+          label: `${b.market.toUpperCase()} — ${b.selection}`,
+        })))
+        const won   = data.filter(b => b.status === 'won').reduce((s, b) => s + b.stake * b.odds, 0)
+        const spent = data.filter(b => b.status !== 'void').reduce((s, b) => s + b.stake, 0)
+        setBalance(INITIAL_BALANCE - spent + won)
       })
   }, [currentUser])
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // ADMIN-ONLY: tick engine, push state to Supabase
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Settle bets at FT ────────────────────────────────────────────────────
   const settleBets = useCallback((finalScore, events) => {
-    setBets(prev => {
-      const updated = prev.map(b => {
-        if (b.status !== 'active') return b
-        let won = false
-        if (b.market === 'match') {
-          const res = finalScore.P > finalScore.A ? 'por' : finalScore.P < finalScore.A ? 'arg' : 'draw'
-          won = b.selection === res
-        } else if (b.market === 'ou') {
-          won = b.selection === 'over' ? (finalScore.P + finalScore.A) > 2.5 : (finalScore.P + finalScore.A) <= 2.5
-        } else if (b.market === 'btts') {
-          const both = finalScore.P > 0 && finalScore.A > 0
-          won = b.selection === 'yes' ? both : !both
-        } else if (b.market === 'ah') {
-          const res = finalScore.P > finalScore.A ? 'por' : 'arg'
-          won = b.selection === res
-        } else if (b.market === 'scorer') {
-          const [team, name] = b.selection.split('_')
-          won = events.some(e => e.type === 'goal' && e.team === team && e.scorer === name)
-        }
-        if (won) setBalance(bal => bal + b.stake * b.odds)
-        return { ...b, status: won ? 'won' : 'lost' }
-      })
-      return updated
-    })
+    setBets(prev => prev.map(b => {
+      if (b.status !== 'active') return b
+      let won = false
+      if (b.market === 'match') {
+        const res = finalScore.P > finalScore.A ? 'por' : finalScore.P < finalScore.A ? 'arg' : 'draw'
+        won = b.selection === res
+      } else if (b.market === 'ou') {
+        won = b.selection === 'over' ? (finalScore.P + finalScore.A) > 2.5 : (finalScore.P + finalScore.A) <= 2.5
+      } else if (b.market === 'btts') {
+        const both = finalScore.P > 0 && finalScore.A > 0
+        won = b.selection === 'yes' ? both : !both
+      } else if (b.market === 'ah') {
+        const res = finalScore.P > finalScore.A ? 'por' : 'arg'
+        won = b.selection === res
+      } else if (b.market === 'scorer') {
+        const [team, name] = b.selection.split('_')
+        won = events.some(e => e.type === 'goal' && e.team === team && e.scorer === name)
+      }
+      if (won) setBalance(bal => bal + b.stake * b.odds)
+      return { ...b, status: won ? 'won' : 'lost' }
+    }))
   }, [])
 
+  // ── Resolve set piece (admin calls this manually) ────────────────────────
   const processSetpiece = useCallback((sp, state) => {
     const { team } = sp
-    const opp    = team === 'portugal' ? 'argentina' : 'portugal'
-    const oppGK  = TEAMS[opp].players.gk
+    const opp   = team === 'portugal' ? 'argentina' : 'portugal'
+    const oppGK = TEAMS[opp].players.gk
     let newScore  = { ...state.score }
     let goalEvent = null
+    let notifMsg  = '', notifType = 'tick'
 
     const penTakers = sp.forcedTaker ? [{ ...sp.forcedTaker, weight: 1 }] : TEAMS[team].players.penalty
     const fkTakers  = sp.forcedTaker ? [{ ...sp.forcedTaker, weight: 1 }] : TEAMS[team].players.freekick
     const corTakers = sp.forcedTaker ? [{ ...sp.forcedTaker, weight: 1 }] : TEAMS[team].players.corner
 
-    let notifMsg = '', notifType = 'tick'
-
     if (sp.type === 'penalty') {
-      const result = resolvePenalty(team, penTakers, oppGK, state.minute)
-      if (result.outcome === 'goal') {
+      const r = resolvePenalty(team, penTakers, oppGK, state.minute)
+      if (r.outcome === 'goal') {
         newScore[team === 'portugal' ? 'P' : 'A']++
-        goalEvent = { type: 'goal', team, scorer: result.taker, penalty: true }
-        notifMsg = `⚽ PENALTY GOAL! ${result.taker} converts! ${newScore.P}–${newScore.A}`; notifType = 'goal'
-      } else if (result.outcome === 'saved') {
-        notifMsg = `🧤 SAVED! ${oppGK} stops ${result.taker}!`; notifType = 'save'
-      } else if (result.outcome === 'post') {
-        notifMsg = `🔔 POST! ${result.taker}'s penalty rattles the woodwork!`; notifType = 'post'
+        goalEvent = { type: 'goal', team, scorer: r.taker, penalty: true }
+        notifMsg = `⚽ PENALTY GOAL! ${r.taker} — ${r.takerDir} corner! ${newScore.P}–${newScore.A}`; notifType = 'goal'
+      } else if (r.outcome === 'saved') {
+        notifMsg = `🧤 SAVED! ${oppGK} dives ${r.keeperDir} — stops ${r.taker}!`; notifType = 'save'
+      } else if (r.outcome === 'post') {
+        notifMsg = `🔔 POST! ${r.taker}'s penalty rattles the woodwork!`; notifType = 'post'
       } else {
-        notifMsg = `❌ MISS! ${result.taker} blazes it over!`; notifType = 'miss'
+        notifMsg = `❌ MISS! ${r.taker} blazes it over!`; notifType = 'miss'
       }
-      // settle sp bets locally
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_penalty' || b.status !== 'active') return b
-        const won = b.selection === result.outcome ||
-          (b.selection === 'miss' && (result.outcome === 'miss' || result.outcome === 'post'))
+        const won = b.selection === r.outcome || (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
         if (won) setBalance(bal => bal + b.stake * b.odds)
         return { ...b, status: won ? 'won' : 'lost' }
       }))
     } else if (sp.type === 'freekick') {
-      const result = resolveFreekick(team, sp.distType, sp.position, fkTakers)
-      const scored = result.outcome === 'goal' || result.outcome === 'goal_header'
+      const r = resolveFreekick(team, sp.distType, sp.position, fkTakers)
+      const scored = r.outcome === 'goal' || r.outcome === 'goal_header'
       if (scored) {
         newScore[team === 'portugal' ? 'P' : 'A']++
-        goalEvent = { type: 'goal', team, scorer: result.goalScorer || result.taker, freekick: true }
-        notifMsg = `⚽ FREE KICK GOAL! ${result.taker} curls it in! ${newScore.P}–${newScore.A}`; notifType = 'goal'
+        goalEvent = { type: 'goal', team, scorer: r.goalScorer || r.taker, freekick: true }
+        notifMsg = `⚽ FREE KICK GOAL! ${r.taker}! ${newScore.P}–${newScore.A}`; notifType = 'goal'
       } else {
-        const msgs = { saved: `🧤 Free kick saved!`, post: `🔔 THE POST!`, offtarget: `❌ Free kick off target.`, blocked: `🛡️ Blocked and cleared!` }
-        notifMsg = msgs[result.outcome] || `Free kick — ${result.outcome}`; notifType = result.outcome === 'saved' ? 'save' : 'miss'
+        const msgs = { saved: `🧤 Free kick saved by ${oppGK}!`, post: `🔔 THE POST! Free kick rattles the bar!`, offtarget: `❌ Free kick off target.`, blocked: `🛡️ Blocked and cleared!` }
+        notifMsg = msgs[r.outcome] || `Free kick — ${r.outcome}`; notifType = r.outcome === 'saved' ? 'save' : 'miss'
       }
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_freekick' || b.status !== 'active') return b
-        const won = (b.selection === 'goal' && scored) || b.selection === result.outcome
+        const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
         if (won) setBalance(bal => bal + b.stake * b.odds)
         return { ...b, status: won ? 'won' : 'lost' }
       }))
     } else if (sp.type === 'corner') {
-      const result = resolveCorner(team, corTakers)
-      const scored = result.outcome === 'goal' || result.outcome === 'goal_header' || result.outcome === 'goal_direct'
+      const r = resolveCorner(team, corTakers)
+      const scored = r.outcome === 'goal' || r.outcome === 'goal_header' || r.outcome === 'goal_direct'
       if (scored) {
         newScore[team === 'portugal' ? 'P' : 'A']++
-        goalEvent = { type: 'goal', team, scorer: result.goalScorer || result.taker, corner: true }
-        notifMsg = `⚽ CORNER GOAL! ${newScore.P}–${newScore.A}`; notifType = 'goal'
+        goalEvent = { type: 'goal', team, scorer: r.goalScorer || r.taker, corner: true }
+        notifMsg = `⚽ CORNER GOAL! ${r.taker} delivers — ${r.goalScorer}! ${newScore.P}–${newScore.A}`; notifType = 'goal'
       } else {
-        const msgs = { saved: `🧤 Corner saved!`, offtarget: `❌ Off target from corner.`, cleared: `🛡️ Corner cleared!` }
-        notifMsg = msgs[result.outcome] || `Corner — ${result.outcome}`; notifType = 'tick'
+        const msgs = { saved: `🧤 Corner saved!`, offtarget: `❌ Corner off target.`, cleared: `🛡️ Corner cleared!` }
+        notifMsg = msgs[r.outcome] || `Corner — ${r.outcome}`; notifType = 'tick'
       }
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_corner' || b.status !== 'active') return b
-        const won = (b.selection === 'goal' && scored) || b.selection === result.outcome
+        const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
         if (won) setBalance(bal => bal + b.stake * b.odds)
         return { ...b, status: won ? 'won' : 'lost' }
       }))
     }
 
-    const newEvents = [...state.events, ...(goalEvent ? [goalEvent] : [])]
-    return { newScore, newEvents, notifMsg, notifType }
+    return { newScore, newEvents: [...state.events, ...(goalEvent ? [goalEvent] : [])], notifMsg, notifType }
   }, [])
 
-  // ── Admin: advance one match minute + push to Supabase ───────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // ADMIN ONLY: tick engine
+  // Key design: auto-tick advances minutes. Set pieces pause the clock.
+  // Admin resolves set pieces manually via adminResolveSetpiece.
+  // Half time requires admin to press RESUME (no auto-resume).
+  // ─────────────────────────────────────────────────────────────────────────
+
   const advanceMinute = useCallback(() => {
     setGs(prev => {
-      if (prev.status === 'finished' || prev.status === 'halftime' || prev.setpiece || prev.paused) return prev
+      if (prev.status !== 'live' || prev.setpiece || prev.paused) return prev
 
       const minute    = prev.minute + 1
       const endFirst  = 45 + prev.halfStoppage.first
@@ -291,15 +251,17 @@ export function useMatch(currentUser = null, isAdmin = false) {
         newNotifs = [{ id: Date.now() + Math.random(), msg, type, ts: Date.now() }, ...newNotifs].slice(0, 80)
       }
 
+      // ── Half time ──
       if (prev.phase === 'first' && minute > endFirst) {
-        const stoppage = Math.min(5, Math.max(0, Math.round(3 + 0.5 * (prev.redCards.portugal + prev.redCards.argentina))))
-        addN(`🔔 HALF TIME — Portugal ${prev.score.P}–${prev.score.A} Argentina.`, 'system')
+        addN(`🔔 HALF TIME — Portugal ${prev.score.P}–${prev.score.A} Argentina. Admin to start second half.`, 'system')
         const next = { ...prev, minute, status: 'halftime', phase: 'second',
-                       halfStoppage: { ...prev.halfStoppage, second: stoppage }, notifications: newNotifs }
+          halfStoppage: { ...prev.halfStoppage, second: Math.min(5, Math.max(0, 3)) },
+          notifications: newNotifs }
         pushMatchState(next)
         return next
       }
 
+      // ── Full time ──
       if (prev.phase === 'second' && minute > endSecond) {
         const winner = prev.score.P > prev.score.A ? 'Portugal' : prev.score.P < prev.score.A ? 'Argentina' : 'Draw'
         addN(`⏱️ FULL TIME — Portugal ${prev.score.P}–${prev.score.A} Argentina! Result: ${winner}`, 'system')
@@ -309,71 +271,45 @@ export function useMatch(currentUser = null, isAdmin = false) {
         return next
       }
 
+      // ── Simulate this minute (goals, cards only — NO auto set pieces) ──
       const sim = simulateMinute(prev)
-      let newScore    = { ...prev.score }
-      let newEvents   = [...prev.events]
-      let newLambdaP  = prev.lambdaP
-      let newLambdaA  = prev.lambdaA
-      let newRedCards = { ...prev.redCards }
-      let newYellows  = { ...prev.yellowCards }
+      let ns = { ...prev.score }, ne = [...prev.events]
+      let nlP = prev.lambdaP, nlA = prev.lambdaA
+      let nRC = { ...prev.redCards }, nYC = { ...prev.yellowCards }
 
-      if (sim.type === 'penalty' || sim.type === 'freekick' || sim.type === 'corner') {
-        const team   = sim.team
-        const spOpts = calcSetPieceOdds(sim)
-        const timers = { penalty: 20, freekick: 30, corner: 25 }
-        const titles = {
-          penalty:  `🚨 PENALTY — ${TEAMS[team].name.toUpperCase()}! 🚨`,
-          freekick: `🎯 FREE KICK — ${TEAMS[team].name.toUpperCase()}`,
-          corner:   `🚩 CORNER — ${TEAMS[team].name.toUpperCase()}`,
-        }
-        const markets = { penalty: 'sp_penalty', freekick: 'sp_freekick', corner: 'sp_corner' }
-        const msgs = {
-          penalty:  `🚨 PENALTY! ${TEAMS[team].name} — Bet now! 20s!`,
-          freekick: `🎯 FREE KICK! ${TEAMS[team].name} — ${sim.distNum || ''}yds ${sim.position || ''}. 30s!`,
-          corner:   `🚩 CORNER! ${TEAMS[team].name} — Bet now! 25s!`,
-        }
-        addN(msgs[sim.type], sim.type === 'penalty' ? 'penalty' : sim.type === 'freekick' ? 'freekick' : 'corner')
-        const next = {
-          ...prev, minute, notifications: newNotifs,
-          setpiece: { ...sim, spOptions: spOpts, spTitle: titles[sim.type], timerSec: timers[sim.type], market: markets[sim.type] },
-        }
-        pushMatchState(next)
-        return next
-      }
+      // NOTE: we deliberately IGNORE sim.type === 'penalty/freekick/corner'
+      // Set pieces are admin-triggered only. We only process normal events.
+      const events = sim.type === 'normal' ? sim.events : []
 
-      for (const ev of sim.events) {
+      for (const ev of events) {
         if (ev.type === 'goal') {
-          const key = ev.team === 'portugal' ? 'P' : 'A'
-          newScore[key]++
-          newEvents.push(ev)
-          if (newScore.P === newScore.A && newScore.P + newScore.A > 0) addN(`🔥 EQUALIZER! ${ev.scorer} — ${newScore.P}–${newScore.A}!`, 'goal')
-          else if (minute > 90) addN(`🚨 STOPPAGE GOAL! ${ev.scorer}! ${newScore.P}–${newScore.A}`, 'goal')
-          else addN(`⚽ GOAL! ${ev.scorer} (${TEAMS[ev.team].short})! ${newScore.P}–${newScore.A} ${minute}'`, 'goal')
+          ns[ev.team === 'portugal' ? 'P' : 'A']++
+          ne.push(ev)
+          if (ns.P === ns.A && ns.P + ns.A > 0) addN(`🔥 EQUALIZER! ${ev.scorer} — ${ns.P}–${ns.A}!`, 'goal')
+          else if (minute > 90) addN(`🚨 STOPPAGE GOAL! ${ev.scorer} for ${TEAMS[ev.team].name}! ${ns.P}–${ns.A}`, 'goal')
+          else addN(`⚽ GOAL! ${ev.scorer} (${TEAMS[ev.team].short})! ${ns.P}–${ns.A} ${minute}'`, 'goal')
         } else if (ev.type === 'redcard') {
-          newRedCards[ev.team]++
-          if (ev.team === 'portugal') newLambdaP *= 0.65; else newLambdaA *= 0.65
-          addN(`🔴 ${ev.secondYellow ? 'SECOND YELLOW' : 'RED CARD'}! ${TEAMS[ev.team].name} 10 men!`, 'card')
+          nRC[ev.team]++
+          if (ev.team === 'portugal') nlP *= 0.65; else nlA *= 0.65
+          addN(`🔴 ${ev.secondYellow ? 'SECOND YELLOW' : 'RED CARD'}! ${TEAMS[ev.team].name} down to 10 men!`, 'card')
         } else if (ev.type === 'yellow') {
-          newYellows[ev.team] = (newYellows[ev.team] || 0) + 1
+          nYC[ev.team] = (nYC[ev.team] || 0) + 1
           addN(`🟨 Yellow card — ${TEAMS[ev.team].name}`, 'card')
         }
       }
 
-      if (minute % 5 === 0 && sim.events.length === 0) addN(`${minute}' — Match continues.`, 'tick')
+      if (minute % 5 === 0 && events.length === 0) addN(`${minute}' — Match continues.`, 'tick')
 
-      const newState = {
-        ...prev, minute, notifications: newNotifs,
-        score: newScore, events: newEvents,
-        lambdaP: newLambdaP, lambdaA: newLambdaA,
-        redCards: newRedCards, yellowCards: newYellows,
-      }
-      recalcOdds(newState)
-      pushMatchState(newState)
-      return newState
+      const next = { ...prev, minute, notifications: newNotifs,
+        score: ns, events: ne, lambdaP: nlP, lambdaA: nlA,
+        redCards: nRC, yellowCards: nYC }
+      recalcOdds(next)
+      pushMatchState(next)
+      return next
     })
   }, [recalcOdds, settleBets])
 
-  // ── Admin tick ───────────────────────────────────────────────────────────
+  // ── Admin auto-tick (runs every TICK_SPEED ms when live) ─────────────────
   useEffect(() => {
     if (!isAdmin) return
     if (gs.status !== 'live' || gs.setpiece || gs.paused) return
@@ -381,87 +317,30 @@ export function useMatch(currentUser = null, isAdmin = false) {
     return () => clearTimeout(timerRef.current)
   }, [isAdmin, gs.status, gs.minute, gs.setpiece, gs.paused, advanceMinute])
 
-  // ── Admin: half-time auto-resume ─────────────────────────────────────────
-  useEffect(() => {
-    if (!isAdmin) return
-    if (gs.status !== 'halftime') return
-    const t = setTimeout(() => {
-      setGs(prev => {
-        const next = { ...prev, status: 'live', phase: 'second', minute: 45,
-                       notifications: [{ id: Date.now(), msg: '▶️ Second half underway!', type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
-        pushMatchState(next)
-        return next
-      })
-    }, 8000)
-    return () => clearTimeout(t)
-  }, [isAdmin, gs.status])
-
-  // ── Set piece countdown (admin resolves, pushes; participants just watch) ─
-  useEffect(() => {
-    if (!gs.setpiece) return
-    setSpTimer(gs.setpiece.timerSec)
-    if (!isAdmin) return   // only admin runs the countdown timer
-    const interval = setInterval(() => {
-      setSpTimer(prev => {
-        if (prev <= 1) {
-          clearInterval(interval)
-          setGs(prevGs => {
-            if (!prevGs.setpiece) return prevGs
-            const { newScore, newEvents, notifMsg, notifType } = processSetpiece(prevGs.setpiece, prevGs)
-            const newNotifs = notifMsg
-              ? [{ id: Date.now(), msg: notifMsg, type: notifType, ts: Date.now() }, ...(prevGs.notifications || [])].slice(0, 80)
-              : prevGs.notifications || []
-            const next = { ...prevGs, score: newScore, events: newEvents, setpiece: null, notifications: newNotifs }
-            recalcOdds(next)
-            pushMatchState(next)
-            return next
-          })
-          return 0
-        }
-        return prev - 1
-      })
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [gs.setpiece?.market, isAdmin, processSetpiece, recalcOdds])
-
-  // ── Participants: mirror spTimer from setpiece timerSec ──────────────────
+  // ── Participant: countdown timer from server setpiece state ──────────────
   useEffect(() => {
     if (isAdmin || !gs.setpiece) return
-    setSpTimer(gs.setpiece.timerSec)
+    setSpTimer(gs.setpiece.timerSec || 30)
     const iv = setInterval(() => setSpTimer(p => Math.max(0, p - 1)), 1000)
     return () => clearInterval(iv)
   }, [isAdmin, gs.setpiece?.market])
 
-  // ── Sync notifications from gs to local state (non-admin) ────────────────
-  useEffect(() => {
-    if (isAdmin) return
-    if (gs.notifications?.length) {
-      setNotifications(gs.notifications.slice(0, 80).map(n => ({ ...n, id: _notifId++ })))
-    }
-  }, [isAdmin, gs.notifications])
-
-  // ── Place bet ────────────────────────────────────────────────────────────
+  // ── Place bet ─────────────────────────────────────────────────────────────
   const placeBet = useCallback((market, selection, oddsVal, maxStakeOverride) => {
     const stake = parseInt(stakeInput) || 0
     const max   = maxStakeOverride || MAX_BET
-    if (stake < MIN_BET)           { pushNotif(`⚠️ Min bet is ${MIN_BET} coins.`, 'warn'); return false }
-    if (stake > max)               { pushNotif(`⚠️ Max bet is ${max} coins.`, 'warn'); return false }
+    if (stake < MIN_BET)  { pushNotif(`⚠️ Min bet is ${MIN_BET} coins.`, 'warn'); return false }
+    if (stake > max)      { pushNotif(`⚠️ Max bet is ${max} coins.`, 'warn'); return false }
     if (betsRef.current.filter(b => b.status === 'active').length >= MAX_ACTIVE_BETS) {
       pushNotif('⚠️ Max 4 active bets at once.', 'warn'); return false
     }
     if (balRef.current < stake) { pushNotif('⚠️ Insufficient balance.', 'warn'); return false }
-
     setBalance(prev => prev - stake)
-    const bet = {
-      id: _notifId++, market, selection, stake, odds: oddsVal,
-      status: 'active', ts: Date.now(),
-      label: `${market.toUpperCase()} — ${selection}`,
-    }
+    const bet = { id: _nid++, market, selection, stake, odds: oddsVal, status: 'active',
+                  ts: Date.now(), label: `${market.toUpperCase()} — ${selection}` }
     setBets(prev => [...prev, bet])
     setBetSlip(null)
     pushNotif(`✅ Bet: ${stake} coins @ ${fmt(oddsVal)} on ${selection}`, 'system')
-
-    // Save to Supabase
     if (currentUser) saveBet(currentUser.id, currentUser.name, bet)
     return true
   }, [stakeInput, pushNotif, currentUser])
@@ -469,7 +348,8 @@ export function useMatch(currentUser = null, isAdmin = false) {
   // ── ADMIN ACTIONS ─────────────────────────────────────────────────────────
 
   const adminKickOff = useCallback(() => {
-    const s = { ...makeInitialMatchState(), status: 'live', minute: 0 }
+    const s = makeInitialMatchState()
+    s.status = 'live'
     s.notifications = [{ id: Date.now(), msg: '⚽ KICK OFF! Portugal vs Argentina is underway!', type: 'system', ts: Date.now() }]
     setGs(s); recalcOdds(s); pushMatchState(s)
     pushNotif('⚽ KICK OFF! Portugal vs Argentina is underway!', 'system')
@@ -478,15 +358,17 @@ export function useMatch(currentUser = null, isAdmin = false) {
   const adminPause = useCallback(() => {
     setGs(prev => {
       const next = { ...prev, paused: true,
-        notifications: [{ id: Date.now(), msg: '⏸️ Match PAUSED by admin.', type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
+        notifications: [{ id: Date.now(), msg: '⏸️ Match PAUSED.', type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
       pushMatchState(next); return next
     })
   }, [])
 
   const adminResume = useCallback(() => {
     setGs(prev => {
+      // Also works to start 2nd half from halftime
       const next = { ...prev, paused: false,
-        notifications: [{ id: Date.now(), msg: '▶️ Match RESUMED.', type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
+        status: prev.status === 'halftime' ? 'live' : prev.status,
+        notifications: [{ id: Date.now(), msg: prev.status === 'halftime' ? '▶️ Second half underway!' : '▶️ Match RESUMED.', type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
       pushMatchState(next); return next
     })
   }, [])
@@ -494,8 +376,9 @@ export function useMatch(currentUser = null, isAdmin = false) {
   const adminEndMatch = useCallback(() => {
     setGs(prev => {
       settleBets(prev.score, prev.events)
+      const winner = prev.score.P > prev.score.A ? 'Portugal' : prev.score.P < prev.score.A ? 'Argentina' : 'Draw'
       const next = { ...prev, status: 'finished',
-        notifications: [{ id: Date.now(), msg: `🛑 Match ended. Final: ${prev.score.P}–${prev.score.A}`, type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
+        notifications: [{ id: Date.now(), msg: `🛑 FULL TIME. Final: Portugal ${prev.score.P}–${prev.score.A} Argentina. ${winner} wins!`, type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
       pushMatchState(next); return next
     })
   }, [settleBets])
@@ -504,18 +387,16 @@ export function useMatch(currentUser = null, isAdmin = false) {
     const initial = makeInitialMatchState()
     setGs(initial); setBets([]); setBalance(INITIAL_BALANCE)
     setOdds(null); setBetSlip(null); setStakeInput('100')
-    setNotifications([mkNotif('🏟️ New match! Portugal vs Argentina.', 'system')])
+    setNotifs([mkN('🏟️ Match reset. Portugal vs Argentina.', 'system')])
     pushMatchState(initial)
   }, [])
 
   const adminAddStoppage = useCallback((mins) => {
     setGs(prev => {
       const phase = prev.phase
-      const next = {
-        ...prev,
+      const next = { ...prev,
         halfStoppage: { ...prev.halfStoppage, [phase]: (prev.halfStoppage[phase] || 0) + mins },
-        notifications: [{ id: Date.now(), msg: `⏱️ +${mins} min stoppage (${phase} half)`, type: 'system', ts: Date.now() }, ...(prev.notifications || [])]
-      }
+        notifications: [{ id: Date.now(), msg: `⏱️ +${mins} min stoppage (${phase} half)`, type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
       pushMatchState(next); return next
     })
   }, [])
@@ -533,9 +414,25 @@ export function useMatch(currentUser = null, isAdmin = false) {
     })
   }, [])
 
+  // ── Admin: manually resolve current set piece ────────────────────────────
+  const adminResolveSetpiece = useCallback(() => {
+    setGs(prev => {
+      if (!prev.setpiece) return prev
+      const { newScore, newEvents, notifMsg, notifType } = processSetpiece(prev.setpiece, prev)
+      const newNotifs = notifMsg
+        ? [{ id: Date.now(), msg: notifMsg, type: notifType, ts: Date.now() }, ...(prev.notifications || [])].slice(0, 80)
+        : prev.notifications || []
+      const next = { ...prev, score: newScore, events: newEvents, setpiece: null, notifications: newNotifs }
+      recalcOdds(next)
+      pushMatchState(next)
+      return next
+    })
+  }, [processSetpiece, recalcOdds])
+
+  // ── Admin: inject events ──────────────────────────────────────────────────
   const adminInjectEvent = useCallback((ev) => {
-    const team    = ev.team
-    const spOpts  = calcSetPieceOdds({ type: ev.type, team, distType: ev.distType, position: ev.position })
+    const { team } = ev
+    const spOpts = calcSetPieceOdds({ type: ev.type, team, distType: ev.distType, position: ev.position })
 
     if (ev.type === 'penalty' || ev.type === 'freekick' || ev.type === 'corner') {
       const timers  = { penalty: 20, freekick: 30, corner: 25 }
@@ -546,13 +443,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
         corner:   `🚩 CORNER — ${TEAMS[team].name.toUpperCase()}`,
       }
       const msgs = {
-        penalty:  `🚨 [ADMIN] PENALTY! ${TEAMS[team].name} — ${ev.forcedTaker?.name || 'auto'}. 20s!`,
-        freekick: `🎯 [ADMIN] FREE KICK! ${TEAMS[team].name} — ${ev.forcedTaker?.name || 'auto'}, ${ev.distNum || '?'}yds. 30s!`,
-        corner:   `🚩 [ADMIN] CORNER! ${TEAMS[team].name} — ${ev.forcedTaker?.name || 'auto'}. 25s!`,
+        penalty:  `🚨 PENALTY! ${TEAMS[team].name} — ${ev.forcedTaker?.name || 'taker TBD'}. Bet now — ${timers.penalty}s!`,
+        freekick: `🎯 FREE KICK! ${TEAMS[team].name} — ${ev.forcedTaker?.name || 'taker TBD'}, ${ev.distNum || '?'}yds ${ev.position || ''}. Bet now — ${timers.freekick}s!`,
+        corner:   `🚩 CORNER! ${TEAMS[team].name} — ${ev.forcedTaker?.name || 'taker TBD'}. Bet now — ${timers.corner}s!`,
       }
       setGs(prev => {
-        const next = {
-          ...prev,
+        const next = { ...prev,
           notifications: [{ id: Date.now(), msg: msgs[ev.type], type: ev.type === 'penalty' ? 'penalty' : ev.type, ts: Date.now() }, ...(prev.notifications || [])],
           setpiece: {
             type: ev.type, team,
@@ -597,13 +493,13 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const nr = { ...prev.redCards, [team]: prev.redCards[team] + 1 }
         const lk = team === 'portugal' ? 'lambdaP' : 'lambdaA'
         const next = { ...prev, redCards: nr, [lk]: prev[lk] * 0.65,
-          notifications: [{ id: Date.now(), msg: `🔴 RED CARD! ${TEAMS[team].name} down to 10 men!`, type: 'card', ts: Date.now() }, ...(prev.notifications || [])] }
+          notifications: [{ id: Date.now(), msg: `🔴 RED CARD! ${TEAMS[team].name} down to 10 men! λ −35%`, type: 'card', ts: Date.now() }, ...(prev.notifications || [])] }
         recalcOdds(next); pushMatchState(next); return next
       })
     }
   }, [recalcOdds])
 
-  // ── After match: save leaderboard ────────────────────────────────────────
+  // ── Save leaderboard at FT ────────────────────────────────────────────────
   useEffect(() => {
     if (gs.status !== 'finished' || !currentUser) return
     saveLeaderboard(currentUser.id, currentUser.name, balRef.current, betsRef.current.length)
@@ -611,13 +507,11 @@ export function useMatch(currentUser = null, isAdmin = false) {
 
   return {
     gs, bets, balance, notifications, odds,
-    betSlip, setBetSlip,
-    stakeInput, setStakeInput,
-    spTimer, connected,
-    placeBet,
-    startMatch: adminKickOff,
-    resetMatch: adminReset,
+    betSlip, setBetSlip, stakeInput, setStakeInput,
+    spTimer, connected, placeBet,
+    startMatch: adminKickOff, resetMatch: adminReset,
     adminKickOff, adminPause, adminResume, adminEndMatch,
-    adminReset, adminAddStoppage, adminVoidMarket, adminInjectEvent,
+    adminReset, adminAddStoppage, adminVoidMarket,
+    adminInjectEvent, adminResolveSetpiece,
   }
 }
