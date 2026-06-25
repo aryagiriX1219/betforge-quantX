@@ -1,24 +1,15 @@
-// ─── MATCH CONFIG ─────────────────────────────────────────────────────────────
-
-export const TICK_SPEED =666  // ms per match minute 
+export const TICK_SPEED     = 40000   // 40s real = 1 match min → 90 min = 60 real min
 export const INITIAL_BALANCE = 1000
-export const MAX_BET = 500
-export const MIN_BET = 10
+export const MAX_BET         = 500
+export const MIN_BET         = 10
 export const MAX_ACTIVE_BETS = 4
-export const VIG = 0.05
-export const ADMIN_PASSWORD = 'betforge2025'
-
-// ─── TEAMS ────────────────────────────────────────────────────────────────────
+export const VIG             = 0.05
+export const ADMIN_PASSWORD  = 'betforge2025'
 
 export const TEAMS = {
   portugal: {
-    name: 'Portugal',
-    short: 'POR',
-    strength: 1.4,
-    homeAdv: 1.2,
-    color: '#006600',
-    accent: '#FF0000',
-    flag: '🟢',
+    name: 'Portugal', short: 'POR', strength: 1.4, homeAdv: 1.2,
+    color: '#006600', accent: '#FF0000', flag: '🟢',
     players: {
       gk: 'Diogo Costa',
       freekick: [
@@ -45,15 +36,9 @@ export const TEAMS = {
       ],
     },
   },
-
   argentina: {
-    name: 'Argentina',
-    short: 'ARG',
-    strength: 1.6,
-    homeAdv: 1.0,
-    color: '#74ACDF',
-    accent: '#FFFFFF',
-    flag: '🔵',
+    name: 'Argentina', short: 'ARG', strength: 1.6, homeAdv: 1.0,
+    color: '#74ACDF', accent: '#FFFFFF', flag: '🔵',
     players: {
       gk: 'E. Martínez',
       freekick: [
@@ -84,7 +69,7 @@ export const TEAMS = {
 
 export const GK_DIVE = {
   'Diogo Costa': { L: 0.40, C: 0.10, R: 0.50 },
-  'E. Martínez':  { L: 0.35, C: 0.15, R: 0.50 },
+  'E. Martínez': { L: 0.35, C: 0.15, R: 0.50 },
 }
 
 export const SCORER_MARKET = [
