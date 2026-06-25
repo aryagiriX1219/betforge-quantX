@@ -28,7 +28,7 @@ const MARKETS = ['match','ou','btts','ah','next','scorer','sp_penalty','sp_freek
 export function AdminPanel({
   gs, bets,
   adminKickOff, adminPause, adminResume, adminEndMatch, adminReset,
-  adminAddStoppage, adminVoidMarket, adminInjectEvent,
+  adminAddStoppage, adminVoidMarket, adminInjectEvent, adminResolveSetpiece,
   onSwitchToPlayer,
 }) {
   const [authed, setAuthed] = useState(false)
@@ -147,6 +147,17 @@ export function AdminPanel({
             {isLive && isPaused && (
               <button style={S.btn('#4eff91')} onClick={() => act(adminResume, 'Match resumed')}>
                 ▶ RESUME
+              </button>
+            )}
+            {gs.status === 'halftime' && (
+              <button style={S.btn('#4eff91')} onClick={() => act(adminResume, 'Second half started')}>
+                ▶ START 2ND HALF
+              </button>
+            )}
+            {gs.setpiece && adminResolveSetpiece && (
+              <button style={{ ...S.btn('#c8ff00'), animation: 'pulse 1s infinite' }}
+                onClick={() => act(adminResolveSetpiece, `Resolved ${gs.setpiece.type}`)}>
+                ⚡ RESOLVE {gs.setpiece?.type?.toUpperCase()}
               </button>
             )}
             <button style={S.btn('#ff5555')} disabled={gs.status === 'prematch' || gs.status === 'finished'}
