@@ -371,7 +371,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
 
   const adminReset = useCallback(() => {
     const initial = makeInitialMatchState()
-    // Reset notifications on server — participants will receive empty list via realtime
     initial.notifications = [{ id: Date.now(), msg: '🏟️ Match reset. Portugal vs Argentina. Waiting for kick off.', type: 'system', ts: Date.now() }]
     setGs(initial)
     setBets([])
@@ -381,6 +380,9 @@ export function useMatch(currentUser = null, isAdmin = false) {
     setStakeInput('100')
     setNotifs([mkN('🏟️ Match reset. Portugal vs Argentina. Waiting for kick off.', 'system')])
     pushMatchState(initial)
+    // Wipe all bets and leaderboard from Supabase so participants start fresh
+    supabase.from('bets').delete().neq('id', 'none').then(() => {})
+    supabase.from('leaderboard').delete().neq('user_id', 0).then(() => {})
   }, [])
 
   const adminAddStoppage = useCallback((mins) => {
@@ -488,6 +490,14 @@ export function useMatch(currentUser = null, isAdmin = false) {
       })
     }
   }, [recalcOdds])
+
+
+  // When match resets to prematch — clear local bets and balance for all clients
+  useEffect(() => {
+    if (gs.status !== 'prematch') return
+    setBets([])
+    setBalance(INITIAL_BALANCE)
+  }, [gs.status])
 
   useEffect(() => {
     if (gs.status !== 'finished' || !currentUser) return
