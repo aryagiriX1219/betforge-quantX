@@ -8,6 +8,8 @@ const MATCH_ROW_ID = 1
 let _nid = 0
 const mkN = (msg, type = 'tick') => ({ id: _nid++, msg, type, ts: Date.now() })
 
+const DEFAULT_NOTIF = [{ id: 0, msg: '🏟️ Welcome to BetForge! Portugal vs Argentina.', type: 'system', ts: Date.now() }]
+
 // ─── INITIAL STATE ────────────────────────────────────────────────────────────
 function makeInitialMatchState() {
   const lambdaP = (TEAMS.portugal.strength * TEAMS.portugal.homeAdv) / 90
@@ -19,7 +21,7 @@ function makeInitialMatchState() {
     yellowCards: { portugal: 0, argentina: 0 },
     halfStoppage: { first: 0, second: 0 },
     phase: 'first', setpiece: null,
-    notifications: [{ id: 0, msg: '🏟️ Welcome to BetForge! Portugal vs Argentina.', type: 'system', ts: Date.now() }],
+    notifications: DEFAULT_NOTIF,
   }
 }
 
@@ -53,17 +55,26 @@ async function saveLeaderboard(userId, userName, balance, betsCount) {
   } catch (e) { console.error('lb error:', e) }
 }
 
+// ─── FORCE-REPLACE notifications from server state ───────────────────────────
+// Always replaces — never merges — so reset clears stale notifications
+function syncNotifs(serverNotifs, setNotifs) {
+  const list = Array.isArray(serverNotifs) && serverNotifs.length
+    ? serverNotifs
+    : DEFAULT_NOTIF
+  setNotifs(list.slice(0, 80).map(n => ({ ...n, id: _nid++ })))
+}
+
 // ─── HOOK ─────────────────────────────────────────────────────────────────────
 export function useMatch(currentUser = null, isAdmin = false) {
-  const [gs, setGs]                   = useState(makeInitialMatchState)
-  const [bets, setBets]               = useState([])
-  const [balance, setBalance]         = useState(INITIAL_BALANCE)
-  const [notifications, setNotifs]    = useState([mkN('🏟️ Welcome! Portugal vs Argentina.', 'system')])
-  const [odds, setOdds]               = useState(null)
-  const [betSlip, setBetSlip]         = useState(null)
-  const [stakeInput, setStakeInput]   = useState('100')
-  const [spTimer, setSpTimer]         = useState(0)
-  const [connected, setConnected]     = useState(false)
+  const [gs, setGs]                 = useState(makeInitialMatchState)
+  const [bets, setBets]             = useState([])
+  const [balance, setBalance]       = useState(INITIAL_BALANCE)
+  const [notifications, setNotifs]  = useState(DEFAULT_NOTIF.map(n => ({ ...n, id: _nid++ })))
+  const [odds, setOdds]             = useState(null)
+  const [betSlip, setBetSlip]       = useState(null)
+  const [stakeInput, setStakeInput] = useState('100')
+  const [spTimer, setSpTimer]       = useState(0)
+  const [connected, setConnected]   = useState(false)
 
   const timerRef   = useRef(null)
   const gsRef      = useRef(gs);      gsRef.current   = gs
@@ -84,19 +95,13 @@ export function useMatch(currentUser = null, isAdmin = false) {
   useEffect(() => {
     supabase.from('match_state').select('state').eq('id', MATCH_ROW_ID).single()
       .then(({ data }) => {
-        // Guard: only use server state if it has a valid score object
         const s = data?.state?.score ? data.state : makeInitialMatchState()
         setGs(s)
         recalcOdds(s)
-        if (s.notifications?.length) {
-          setNotifs(s.notifications.slice(0, 80).map(n => ({ ...n, id: _nid++ })))
-        }
+        syncNotifs(s.notifications, setNotifs)  // always force-replace
         setConnected(true)
       })
-      .catch(() => {
-        // Supabase unreachable — fall back to local state gracefully
-        setConnected(false)
-      })
+      .catch(() => setConnected(false))
 
     const channel = supabase
       .channel('match_state_changes')
@@ -106,12 +111,9 @@ export function useMatch(currentUser = null, isAdmin = false) {
       }, (payload) => {
         const s = payload.new?.state
         if (!s?.score) return
-        // ALL clients (including admin) sync from server on change
         setGs(s)
         recalcOdds(s)
-        if (s.notifications?.length) {
-          setNotifs(s.notifications.slice(0, 80).map(n => ({ ...n, id: _nid++ })))
-        }
+        syncNotifs(s.notifications, setNotifs)  // always force-replace on every update
       })
       .subscribe((status) => setConnected(status === 'SUBSCRIBED'))
 
@@ -231,13 +233,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
     return { newScore, newEvents: [...state.events, ...(goalEvent ? [goalEvent] : [])], notifMsg, notifType }
   }, [])
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // ADMIN ONLY: tick engine
-  // Key design: auto-tick advances minutes. Set pieces pause the clock.
-  // Admin resolves set pieces manually via adminResolveSetpiece.
-  // Half time requires admin to press RESUME (no auto-resume).
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Admin tick engine ─────────────────────────────────────────────────────
   const advanceMinute = useCallback(() => {
     setGs(prev => {
       if (prev.status !== 'live' || prev.setpiece || prev.paused) return prev
@@ -251,17 +247,14 @@ export function useMatch(currentUser = null, isAdmin = false) {
         newNotifs = [{ id: Date.now() + Math.random(), msg, type, ts: Date.now() }, ...newNotifs].slice(0, 80)
       }
 
-      // ── Half time ──
       if (prev.phase === 'first' && minute > endFirst) {
         addN(`🔔 HALF TIME — Portugal ${prev.score.P}–${prev.score.A} Argentina. Admin to start second half.`, 'system')
         const next = { ...prev, minute, status: 'halftime', phase: 'second',
-          halfStoppage: { ...prev.halfStoppage, second: Math.min(5, Math.max(0, 3)) },
-          notifications: newNotifs }
+          halfStoppage: { ...prev.halfStoppage, second: 3 }, notifications: newNotifs }
         pushMatchState(next)
         return next
       }
 
-      // ── Full time ──
       if (prev.phase === 'second' && minute > endSecond) {
         const winner = prev.score.P > prev.score.A ? 'Portugal' : prev.score.P < prev.score.A ? 'Argentina' : 'Draw'
         addN(`⏱️ FULL TIME — Portugal ${prev.score.P}–${prev.score.A} Argentina! Result: ${winner}`, 'system')
@@ -271,14 +264,10 @@ export function useMatch(currentUser = null, isAdmin = false) {
         return next
       }
 
-      // ── Simulate this minute (goals, cards only — NO auto set pieces) ──
       const sim = simulateMinute(prev)
       let ns = { ...prev.score }, ne = [...prev.events]
       let nlP = prev.lambdaP, nlA = prev.lambdaA
       let nRC = { ...prev.redCards }, nYC = { ...prev.yellowCards }
-
-      // NOTE: we deliberately IGNORE sim.type === 'penalty/freekick/corner'
-      // Set pieces are admin-triggered only. We only process normal events.
       const events = sim.type === 'normal' ? sim.events : []
 
       for (const ev of events) {
@@ -309,7 +298,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
     })
   }, [recalcOdds, settleBets])
 
-  // ── Admin auto-tick (runs every TICK_SPEED ms when live) ─────────────────
   useEffect(() => {
     if (!isAdmin) return
     if (gs.status !== 'live' || gs.setpiece || gs.paused) return
@@ -317,7 +305,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
     return () => clearTimeout(timerRef.current)
   }, [isAdmin, gs.status, gs.minute, gs.setpiece, gs.paused, advanceMinute])
 
-  // ── Participant: countdown timer from server setpiece state ──────────────
   useEffect(() => {
     if (isAdmin || !gs.setpiece) return
     setSpTimer(gs.setpiece.timerSec || 30)
@@ -352,8 +339,8 @@ export function useMatch(currentUser = null, isAdmin = false) {
     s.status = 'live'
     s.notifications = [{ id: Date.now(), msg: '⚽ KICK OFF! Portugal vs Argentina is underway!', type: 'system', ts: Date.now() }]
     setGs(s); recalcOdds(s); pushMatchState(s)
-    pushNotif('⚽ KICK OFF! Portugal vs Argentina is underway!', 'system')
-  }, [recalcOdds, pushNotif])
+    setNotifs([mkN('⚽ KICK OFF! Portugal vs Argentina is underway!', 'system')])
+  }, [recalcOdds])
 
   const adminPause = useCallback(() => {
     setGs(prev => {
@@ -365,7 +352,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
 
   const adminResume = useCallback(() => {
     setGs(prev => {
-      // Also works to start 2nd half from halftime
       const next = { ...prev, paused: false,
         status: prev.status === 'halftime' ? 'live' : prev.status,
         notifications: [{ id: Date.now(), msg: prev.status === 'halftime' ? '▶️ Second half underway!' : '▶️ Match RESUMED.', type: 'system', ts: Date.now() }, ...(prev.notifications || [])] }
@@ -385,9 +371,15 @@ export function useMatch(currentUser = null, isAdmin = false) {
 
   const adminReset = useCallback(() => {
     const initial = makeInitialMatchState()
-    setGs(initial); setBets([]); setBalance(INITIAL_BALANCE)
-    setOdds(null); setBetSlip(null); setStakeInput('100')
-    setNotifs([mkN('🏟️ Match reset. Portugal vs Argentina.', 'system')])
+    // Reset notifications on server — participants will receive empty list via realtime
+    initial.notifications = [{ id: Date.now(), msg: '🏟️ Match reset. Portugal vs Argentina. Waiting for kick off.', type: 'system', ts: Date.now() }]
+    setGs(initial)
+    setBets([])
+    setBalance(INITIAL_BALANCE)
+    setOdds(null)
+    setBetSlip(null)
+    setStakeInput('100')
+    setNotifs([mkN('🏟️ Match reset. Portugal vs Argentina. Waiting for kick off.', 'system')])
     pushMatchState(initial)
   }, [])
 
@@ -414,7 +406,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
     })
   }, [])
 
-  // ── Admin: manually resolve current set piece ────────────────────────────
   const adminResolveSetpiece = useCallback(() => {
     setGs(prev => {
       if (!prev.setpiece) return prev
@@ -429,7 +420,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
     })
   }, [processSetpiece, recalcOdds])
 
-  // ── Admin: inject events ──────────────────────────────────────────────────
   const adminInjectEvent = useCallback((ev) => {
     const { team } = ev
     const spOpts = calcSetPieceOdds({ type: ev.type, team, distType: ev.distType, position: ev.position })
@@ -499,7 +489,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
     }
   }, [recalcOdds])
 
-  // ── Save leaderboard at FT ────────────────────────────────────────────────
   useEffect(() => {
     if (gs.status !== 'finished' || !currentUser) return
     saveLeaderboard(currentUser.id, currentUser.name, balRef.current, betsRef.current.length)
