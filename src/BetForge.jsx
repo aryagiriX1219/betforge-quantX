@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { INITIAL_BALANCE } from './constants'
 import {
   Scoreboard, NotifFeed, BetList, Markets, BetSlip,
@@ -111,12 +112,25 @@ export default function BetForge({ currentUser, match, onLogout, onAdmin }) {
   )
 }
 
+// ── MM:SS clock — seconds count 0→39 per match minute (40s real = 1 game min)
 function StatusBadge({ status, minute, paused }) {
+  const [secs, setSecs] = useState(0)
+
+  useEffect(() => {
+    if (status !== 'live' || paused) { setSecs(0); return }
+    setSecs(0)
+    const iv = setInterval(() => setSecs(s => (s >= 39 ? 0 : s + 1)), 1000)
+    return () => clearInterval(iv)
+  }, [status, minute, paused])
+
+  const mm = String(minute).padStart(2, '0')
+  const ss = String(secs).padStart(2, '0')
+
   const map = {
-    prematch: { label: 'PRE-MATCH', bg: '#222', color: '#558855' },
-    live:     { label: paused ? `⏸ ${minute}'` : `● ${minute}'`, bg: paused ? '#333' : '#c8ff00', color: paused ? '#ffdd00' : '#080d0a' },
-    halftime: { label: 'HT', bg: '#555', color: '#fff' },
-    finished: { label: 'FT', bg: '#333', color: '#888' },
+    prematch: { label: 'PRE-MATCH', bg: '#222',    color: '#558855' },
+    live:     { label: paused ? `⏸ ${mm}:${ss}` : `● ${mm}:${ss}`, bg: paused ? '#333' : '#c8ff00', color: paused ? '#ffdd00' : '#080d0a' },
+    halftime: { label: 'HALF TIME', bg: '#555',    color: '#fff' },
+    finished: { label: 'FULL TIME', bg: '#333',    color: '#888' },
   }
   const s = map[status] || map.prematch
   return (
