@@ -2,9 +2,9 @@ export const TICK_SPEED     = 40000   // 40s real = 1 match min → 90 min = 60 
 export const INITIAL_BALANCE = 1000
 export const MAX_BET         = 500
 export const MIN_BET         = 10
-export const MAX_ACTIVE_BETS = 4
+export const MAX_ACTIVE_BETS = 999
 export const VIG             = 0.05
-export const ADMIN_PASSWORD  = 'betforge2025'
+export const ADMIN_PASSWORD  = 'betforge2026'
 
 export const TEAMS = {
   portugal: {
