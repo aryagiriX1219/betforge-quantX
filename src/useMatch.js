@@ -43,20 +43,19 @@ async function saveBet(userId, userName, bet) {
   } catch (e) { console.error('bet save error:', e) }
 }
 
-async function saveLeaderboard(userId, userName, balance, betsCount) {
+async function saveLeaderboard(userId, userName, balance, wonCount, lostCount, totalSettled) {
   try {
     await supabase.from('leaderboard').upsert({
       user_id: userId, user_name: userName,
       balance: Math.round(balance),
       pnl: Math.round(balance - INITIAL_BALANCE),
-      bets_count: betsCount,
+      bets_count: totalSettled,
       updated_at: new Date().toISOString(),
     })
   } catch (e) { console.error('lb error:', e) }
 }
 
 // ─── FORCE-REPLACE notifications from server state ───────────────────────────
-// Always replaces — never merges — so reset clears stale notifications
 function syncNotifs(serverNotifs, setNotifs) {
   const list = Array.isArray(serverNotifs) && serverNotifs.length
     ? serverNotifs
@@ -77,10 +76,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
   const [connected, setConnected]   = useState(false)
 
   const timerRef   = useRef(null)
-  const gsRef      = useRef(gs);      gsRef.current   = gs
-  const betsRef    = useRef(bets);    betsRef.current = bets
-  const balRef     = useRef(balance); balRef.current  = balance
-  const isAdminRef = useRef(isAdmin); isAdminRef.current = isAdmin
+  const gsRef      = useRef(gs);           gsRef.current      = gs
+  const betsRef    = useRef(bets);         betsRef.current    = bets
+  const balRef     = useRef(balance);      balRef.current     = balance
+  const isAdminRef = useRef(isAdmin);      isAdminRef.current = isAdmin
+  // userRef lets callbacks with [] deps always access the latest currentUser
+  const userRef    = useRef(currentUser);  userRef.current    = currentUser
 
   const pushNotif = useCallback((msg, type = 'tick') => {
     setNotifs(prev => [mkN(msg, type), ...prev].slice(0, 80))
@@ -98,7 +99,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const s = data?.state?.score ? data.state : makeInitialMatchState()
         setGs(s)
         recalcOdds(s)
-        syncNotifs(s.notifications, setNotifs)  // always force-replace
+        syncNotifs(s.notifications, setNotifs)
         setConnected(true)
       })
       .catch(() => setConnected(false))
@@ -113,14 +114,14 @@ export function useMatch(currentUser = null, isAdmin = false) {
         if (!s?.score) return
         setGs(s)
         recalcOdds(s)
-        syncNotifs(s.notifications, setNotifs)  // always force-replace on every update
+        syncNotifs(s.notifications, setNotifs)
       })
       .subscribe((status) => setConnected(status === 'SUBSCRIBED'))
 
     return () => supabase.removeChannel(channel)
   }, [recalcOdds])
 
-  // ── Load user's bets from Supabase ────────────────────────────────────────
+  // ── Load user's bets from Supabase on login ───────────────────────────────
   useEffect(() => {
     if (!currentUser) return
     supabase.from('bets').select('*').eq('user_id', currentUser.id)
@@ -129,6 +130,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
         setBets(data.map(b => ({
           id: b.id, market: b.market, selection: b.selection,
           stake: b.stake, odds: b.odds, status: b.status,
+          ts: b.ts || 0,
           label: `${b.market.toUpperCase()} — ${b.selection}`,
         })))
         const won   = data.filter(b => b.status === 'won').reduce((s, b) => s + b.stake * b.odds, 0)
@@ -137,32 +139,73 @@ export function useMatch(currentUser = null, isAdmin = false) {
       })
   }, [currentUser])
 
-  // ── Settle bets at FT ────────────────────────────────────────────────────
+  // ── Helper: settle one bet and persist to Supabase ────────────────────────
+  // Returns the updated bet object. Call inside setBets map only.
+  const _settleSingle = useCallback((b, won) => {
+    if (won) setBalance(bal => bal + b.stake * b.odds)
+    const updated = { ...b, status: won ? 'won' : 'lost' }
+    if (userRef.current) saveBet(userRef.current.id, userRef.current.name, updated)
+    return updated
+  }, [])
+
+  // ── Settle all remaining active bets at FT ───────────────────────────────
+  // FIX: Added 'next' market settlement + saveBet on every outcome
   const settleBets = useCallback((finalScore, events) => {
     setBets(prev => prev.map(b => {
       if (b.status !== 'active') return b
       let won = false
+
       if (b.market === 'match') {
         const res = finalScore.P > finalScore.A ? 'por' : finalScore.P < finalScore.A ? 'arg' : 'draw'
         won = b.selection === res
+
       } else if (b.market === 'ou') {
-        won = b.selection === 'over' ? (finalScore.P + finalScore.A) > 2.5 : (finalScore.P + finalScore.A) <= 2.5
+        won = b.selection === 'over'
+          ? (finalScore.P + finalScore.A) > 2.5
+          : (finalScore.P + finalScore.A) <= 2.5
+
       } else if (b.market === 'btts') {
         const both = finalScore.P > 0 && finalScore.A > 0
         won = b.selection === 'yes' ? both : !both
+
       } else if (b.market === 'ah') {
         const res = finalScore.P > finalScore.A ? 'por' : 'arg'
         won = b.selection === res
+
       } else if (b.market === 'scorer') {
         const [team, name] = b.selection.split('_')
         won = events.some(e => e.type === 'goal' && e.team === team && e.scorer === name)
+
+      } else if (b.market === 'next') {
+        // FIX Bug 2: Next goal market — find first goal event after bet was placed
+        const nextGoal = events.find(e => e.type === 'goal' && (e.ts || 0) > (b.ts || 0))
+        if (nextGoal) {
+          won = b.selection === nextGoal.team
+        } else {
+          // No goal scored after bet — 'none' wins
+          won = b.selection === 'none'
+        }
       }
-      if (won) setBalance(bal => bal + b.stake * b.odds)
-      return { ...b, status: won ? 'won' : 'lost' }
+
+      return _settleSingle(b, won)
     }))
+  }, [_settleSingle])
+
+  // ── FIX Bug 3: Save leaderboard with correct post-settlement balance ───────
+  // Called after a brief delay so React has flushed setBalance state updates
+  const _saveLeaderboardDelayed = useCallback(() => {
+    setTimeout(() => {
+      const u = userRef.current
+      if (!u) return
+      const allBets    = betsRef.current
+      const wonCount   = allBets.filter(b => b.status === 'won').length
+      const lostCount  = allBets.filter(b => b.status === 'lost').length
+      const settled    = wonCount + lostCount
+      saveLeaderboard(u.id, u.name, balRef.current, wonCount, lostCount, settled)
+    }, 800) // 800ms — enough for React to flush all setBalance calls
   }, [])
 
-  // ── Resolve set piece (admin calls this manually) ────────────────────────
+  // ── Resolve set piece (admin calls this manually) ─────────────────────────
   const processSetpiece = useCallback((sp, state) => {
     const { team } = sp
     const opp   = team === 'portugal' ? 'argentina' : 'portugal'
@@ -179,7 +222,8 @@ export function useMatch(currentUser = null, isAdmin = false) {
       const r = resolvePenalty(team, penTakers, oppGK, state.minute)
       if (r.outcome === 'goal') {
         newScore[team === 'portugal' ? 'P' : 'A']++
-        goalEvent = { type: 'goal', team, scorer: r.taker, penalty: true }
+        // FIX: Add ts so next-goal market can compare against bet placement time
+        goalEvent = { type: 'goal', team, scorer: r.taker, penalty: true, ts: Date.now() }
         notifMsg = `⚽ PENALTY GOAL! ${r.taker} — ${r.takerDir} corner! ${newScore.P}–${newScore.A}`; notifType = 'goal'
       } else if (r.outcome === 'saved') {
         notifMsg = `🧤 SAVED! ${oppGK} dives ${r.keeperDir} — stops ${r.taker}!`; notifType = 'save'
@@ -188,50 +232,53 @@ export function useMatch(currentUser = null, isAdmin = false) {
       } else {
         notifMsg = `❌ MISS! ${r.taker} blazes it over!`; notifType = 'miss'
       }
+      // FIX Bug 1: settle sp_penalty bets and persist to Supabase
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_penalty' || b.status !== 'active') return b
-        const won = b.selection === r.outcome || (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
-        if (won) setBalance(bal => bal + b.stake * b.odds)
-        return { ...b, status: won ? 'won' : 'lost' }
+        const won = b.selection === r.outcome ||
+          (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
+        return _settleSingle(b, won)
       }))
+
     } else if (sp.type === 'freekick') {
       const r = resolveFreekick(team, sp.distType, sp.position, fkTakers)
       const scored = r.outcome === 'goal' || r.outcome === 'goal_header'
       if (scored) {
         newScore[team === 'portugal' ? 'P' : 'A']++
-        goalEvent = { type: 'goal', team, scorer: r.goalScorer || r.taker, freekick: true }
+        goalEvent = { type: 'goal', team, scorer: r.goalScorer || r.taker, freekick: true, ts: Date.now() }
         notifMsg = `⚽ FREE KICK GOAL! ${r.taker}! ${newScore.P}–${newScore.A}`; notifType = 'goal'
       } else {
         const msgs = { saved: `🧤 Free kick saved by ${oppGK}!`, post: `🔔 THE POST! Free kick rattles the bar!`, offtarget: `❌ Free kick off target.`, blocked: `🛡️ Blocked and cleared!` }
         notifMsg = msgs[r.outcome] || `Free kick — ${r.outcome}`; notifType = r.outcome === 'saved' ? 'save' : 'miss'
       }
+      // FIX Bug 1: settle sp_freekick bets and persist to Supabase
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_freekick' || b.status !== 'active') return b
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
-        if (won) setBalance(bal => bal + b.stake * b.odds)
-        return { ...b, status: won ? 'won' : 'lost' }
+        return _settleSingle(b, won)
       }))
+
     } else if (sp.type === 'corner') {
       const r = resolveCorner(team, corTakers)
       const scored = r.outcome === 'goal' || r.outcome === 'goal_header' || r.outcome === 'goal_direct'
       if (scored) {
         newScore[team === 'portugal' ? 'P' : 'A']++
-        goalEvent = { type: 'goal', team, scorer: r.goalScorer || r.taker, corner: true }
+        goalEvent = { type: 'goal', team, scorer: r.goalScorer || r.taker, corner: true, ts: Date.now() }
         notifMsg = `⚽ CORNER GOAL! ${r.taker} delivers — ${r.goalScorer}! ${newScore.P}–${newScore.A}`; notifType = 'goal'
       } else {
         const msgs = { saved: `🧤 Corner saved!`, offtarget: `❌ Corner off target.`, cleared: `🛡️ Corner cleared!` }
         notifMsg = msgs[r.outcome] || `Corner — ${r.outcome}`; notifType = 'tick'
       }
+      // FIX Bug 1: settle sp_corner bets and persist to Supabase
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_corner' || b.status !== 'active') return b
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
-        if (won) setBalance(bal => bal + b.stake * b.odds)
-        return { ...b, status: won ? 'won' : 'lost' }
+        return _settleSingle(b, won)
       }))
     }
 
     return { newScore, newEvents: [...state.events, ...(goalEvent ? [goalEvent] : [])], notifMsg, notifType }
-  }, [])
+  }, [_settleSingle])
 
   // ── Admin tick engine ─────────────────────────────────────────────────────
   const advanceMinute = useCallback(() => {
@@ -273,10 +320,22 @@ export function useMatch(currentUser = null, isAdmin = false) {
       for (const ev of events) {
         if (ev.type === 'goal') {
           ns[ev.team === 'portugal' ? 'P' : 'A']++
-          ne.push(ev)
+          // FIX: stamp ts on every goal event so 'next' market can compare timestamps
+          ne.push({ ...ev, ts: Date.now() })
           if (ns.P === ns.A && ns.P + ns.A > 0) addN(`🔥 EQUALIZER! ${ev.scorer} — ${ns.P}–${ns.A}!`, 'goal')
           else if (minute > 90) addN(`🚨 STOPPAGE GOAL! ${ev.scorer} for ${TEAMS[ev.team].name}! ${ns.P}–${ns.A}`, 'goal')
           else addN(`⚽ GOAL! ${ev.scorer} (${TEAMS[ev.team].short})! ${ns.P}–${ns.A} ${minute}'`, 'goal')
+
+          // FIX Bug 2: Settle 'next' market bets on every open-play goal immediately
+          const goalTeam = ev.team
+          const goalTs   = Date.now()
+          setBets(prev => prev.map(b => {
+            if (b.market !== 'next' || b.status !== 'active') return b
+            if ((b.ts || 0) >= goalTs) return b // bet placed after this goal — skip
+            const won = b.selection === goalTeam
+            return _settleSingle(b, won)
+          }))
+
         } else if (ev.type === 'redcard') {
           nRC[ev.team]++
           if (ev.team === 'portugal') nlP *= 0.65; else nlA *= 0.65
@@ -296,7 +355,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
       pushMatchState(next)
       return next
     })
-  }, [recalcOdds, settleBets])
+  }, [recalcOdds, settleBets, _settleSingle])
 
   useEffect(() => {
     if (!isAdmin) return
@@ -380,7 +439,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
     setStakeInput('100')
     setNotifs([mkN('🏟️ Match reset. Portugal vs Argentina. Waiting for kick off.', 'system')])
     pushMatchState(initial)
-    // Wipe all bets and leaderboard from Supabase so participants start fresh
     supabase.from('bets').delete().neq('id', 'none').then(() => {})
     supabase.from('leaderboard').delete().neq('user_id', 0).then(() => {})
   }, [])
@@ -395,12 +453,23 @@ export function useMatch(currentUser = null, isAdmin = false) {
     })
   }, [])
 
+  // FIX Bug 5: adminVoidMarket — update ALL users' bets in Supabase directly,
+  // not just local state (local state only belongs to the currently logged-in user)
   const adminVoidMarket = useCallback((market) => {
+    // Update Supabase for all users with active bets on this market
+    supabase.from('bets')
+      .update({ status: 'void', updated_at: new Date().toISOString() })
+      .eq('market', market)
+      .eq('status', 'active')
+      .then(({ error }) => { if (error) console.error('void update error:', error) })
+
+    // Update local state + refund balance for the current user
     setBets(prev => prev.map(b => {
       if (b.market !== market || b.status !== 'active') return b
       setBalance(bal => bal + b.stake)
       return { ...b, status: 'void' }
     }))
+
     setGs(prev => {
       const next = { ...prev,
         notifications: [{ id: Date.now(), msg: `🚫 Market "${market}" voided — stakes refunded.`, type: 'warn', ts: Date.now() }, ...(prev.notifications || [])] }
@@ -456,10 +525,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
     }
 
     if (ev.type === 'goal') {
+      // FIX: stamp ts on admin-injected goals too
+      const goalTs = Date.now()
       setGs(prev => {
         const key = team === 'portugal' ? 'P' : 'A'
         const newScore  = { ...prev.score, [key]: prev.score[key] + 1 }
-        const newEvents = [...prev.events, { type: 'goal', team, scorer: ev.scorer || 'Open Play' }]
+        const newEvents = [...prev.events, { type: 'goal', team, scorer: ev.scorer || 'Open Play', ts: goalTs }]
         const msg = newScore.P === newScore.A && newScore.P + newScore.A > 0
           ? `🔥 EQUALIZER! ${ev.scorer || 'Open Play'} — ${newScore.P}–${newScore.A}!`
           : `⚽ GOAL! ${ev.scorer || 'Open Play'} (${TEAMS[team].short})! ${newScore.P}–${newScore.A} ${prev.minute}'`
@@ -467,6 +538,13 @@ export function useMatch(currentUser = null, isAdmin = false) {
           notifications: [{ id: Date.now(), msg, type: 'goal', ts: Date.now() }, ...(prev.notifications || [])] }
         recalcOdds(next); pushMatchState(next); return next
       })
+      // FIX Bug 2: Settle 'next' market bets on admin-injected goals too
+      setBets(prev => prev.map(b => {
+        if (b.market !== 'next' || b.status !== 'active') return b
+        if ((b.ts || 0) >= goalTs) return b
+        const won = b.selection === team
+        return _settleSingle(b, won)
+      }))
       return
     }
 
@@ -489,8 +567,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
         recalcOdds(next); pushMatchState(next); return next
       })
     }
-  }, [recalcOdds])
-
+  }, [recalcOdds, _settleSingle])
 
   // When match resets to prematch — clear local bets and balance for all clients
   useEffect(() => {
@@ -499,10 +576,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
     setBalance(INITIAL_BALANCE)
   }, [gs.status])
 
+  // FIX Bug 3: Save leaderboard after a delay so setBalance has flushed,
+  // and use only settled (won+lost) bets for bets_count — not active/void
   useEffect(() => {
     if (gs.status !== 'finished' || !currentUser) return
-    saveLeaderboard(currentUser.id, currentUser.name, balRef.current, betsRef.current.length)
-  }, [gs.status, currentUser])
+    _saveLeaderboardDelayed()
+  }, [gs.status, currentUser, _saveLeaderboardDelayed])
 
   return {
     gs, bets, balance, notifications, odds,
