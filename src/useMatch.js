@@ -136,7 +136,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
               })
               if (!hit || b.status === hit.status) return b
               anyChange = true
-              if (hit.status === 'won') setBalance(bal => bal + b.stake * b.odds)
+              if (hit.status === 'won') setBalance(bal => bal + Math.round(b.stake * b.odds))
               return { ...b, status: hit.status }
             })
             return anyChange ? next : prev
@@ -515,7 +515,14 @@ export function useMatch(currentUser = null, isAdmin = false) {
     setBets(prev => [...prev, bet])
     setBetSlip(null)
     pushNotif(`✅ Bet: ${stake} coins @ ${fmt(oddsVal)} on ${selection}`, 'system')
-    if (currentUser) saveBet(currentUser.id, currentUser.name, bet)
+    if (currentUser) {
+      saveBet(currentUser.id, currentUser.name, bet)
+      // Write to leaderboard immediately so admin sees participant from first bet
+      const allBets = [...betsRef.current, bet]
+      const wonCount  = allBets.filter(b => b.status === 'won').length
+      const lostCount = allBets.filter(b => b.status === 'lost').length
+      saveLeaderboard(currentUser.id, currentUser.name, balRef.current - stake, wonCount, lostCount, wonCount + lostCount)
+    }
     return true
   }, [stakeInput, pushNotif, currentUser])
 
