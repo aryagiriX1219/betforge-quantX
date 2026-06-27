@@ -121,6 +121,22 @@ export function useMatch(currentUser = null, isAdmin = false) {
         setGs(s)
         recalcOdds(s)
         syncNotifs(s.notifications, setNotifs)
+        // SETTLEMENT VIA MATCH STATE: apply any settlements broadcast by admin
+        // This piggybacks on the already-working match_state realtime channel
+        // so we don't need a separate bets subscription at all.
+        if (s.settlements?.length) {
+          setBets(prev => {
+            let anyChange = false
+            const next = prev.map(b => {
+              const hit = s.settlements.find(sv => sv.id === b.id)
+              if (!hit || b.status === hit.status) return b
+              anyChange = true
+              if (hit.status === 'won') setBalance(bal => bal + b.stake * b.odds)
+              return { ...b, status: hit.status }
+            })
+            return anyChange ? next : prev
+          })
+        }
       })
       .subscribe((status) => setConnected(status === 'SUBSCRIBED'))
 
@@ -237,10 +253,10 @@ export function useMatch(currentUser = null, isAdmin = false) {
       return _settleSingle(b, won)
     }))
 
-    // Fetch and settle ALL active bets in Supabase (covers every participant)
+    // Fetch and settle ALL active bets in Supabase + broadcast via match_state
     supabase.from('bets').select('*').eq('status', 'active').then(({ data }) => {
       if (!data?.length) return
-      data.forEach(b => {
+      const settlements = data.map(b => {
         let won = false
         if (b.market === 'match') {
           const res = finalScore.P > finalScore.A ? 'por' : finalScore.P < finalScore.A ? 'arg' : 'draw'
@@ -264,7 +280,10 @@ export function useMatch(currentUser = null, isAdmin = false) {
           .update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() })
           .eq('id', b.id)
           .then(({ error }) => { if (error) console.error('ft settle error:', error) })
+        return { id: b.id, status: won ? 'won' : 'lost' }
       })
+      // Broadcast all settlements via match_state so every client updates instantly
+      setGs(prev => { const next = { ...prev, settlements }; pushMatchState(next); return next })
     })
   }, [_settleSingle])
 
@@ -309,20 +328,27 @@ export function useMatch(currentUser = null, isAdmin = false) {
       } else {
         notifMsg = `❌ MISS! ${r.taker} blazes it over!`; notifType = 'miss'
       }
-      // Settle sp_penalty: update local state + ALL users' rows in Supabase
+      // Settle sp_penalty locally + broadcast via match_state for all clients
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_penalty' || b.status !== 'active') return b
         const won = b.selection === r.outcome ||
           (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
         return _settleSingle(b, won)
       }))
-      // CRITICAL FIX: fetch all sp_penalty bets from Supabase and settle for all users
+      // Fetch all sp_penalty bets, settle in Supabase, and broadcast via match_state
       supabase.from('bets').select('*').eq('market', 'sp_penalty').eq('status', 'active').then(({ data }) => {
         if (!data?.length) return
-        data.forEach(b => {
+        const settlements = data.map(b => {
           const won = b.selection === r.outcome ||
             (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
           supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
+          return { id: b.id, status: won ? 'won' : 'lost' }
+        })
+        // Broadcast settlements through match_state so every client receives them
+        setGs(prev => {
+          const next = { ...prev, settlements }
+          pushMatchState(next)
+          return next
         })
       })
 
@@ -337,7 +363,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const msgs = { saved: `🧤 Free kick saved by ${oppGK}!`, post: `🔔 THE POST! Free kick rattles the bar!`, offtarget: `❌ Free kick off target.`, blocked: `🛡️ Blocked and cleared!` }
         notifMsg = msgs[r.outcome] || `Free kick — ${r.outcome}`; notifType = r.outcome === 'saved' ? 'save' : 'miss'
       }
-      // Settle sp_freekick: update local + all users in Supabase
+      // Settle sp_freekick locally + broadcast via match_state
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_freekick' || b.status !== 'active') return b
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
@@ -345,10 +371,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
       }))
       supabase.from('bets').select('*').eq('market', 'sp_freekick').eq('status', 'active').then(({ data }) => {
         if (!data?.length) return
-        data.forEach(b => {
+        const settlements = data.map(b => {
           const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
           supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
+          return { id: b.id, status: won ? 'won' : 'lost' }
         })
+        setGs(prev => { const next = { ...prev, settlements }; pushMatchState(next); return next })
       })
 
     } else if (sp.type === 'corner') {
@@ -362,7 +390,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const msgs = { saved: `🧤 Corner saved!`, offtarget: `❌ Corner off target.`, cleared: `🛡️ Corner cleared!` }
         notifMsg = msgs[r.outcome] || `Corner — ${r.outcome}`; notifType = 'tick'
       }
-      // Settle sp_corner: update local + all users in Supabase
+      // Settle sp_corner locally + broadcast via match_state
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_corner' || b.status !== 'active') return b
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
@@ -370,10 +398,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
       }))
       supabase.from('bets').select('*').eq('market', 'sp_corner').eq('status', 'active').then(({ data }) => {
         if (!data?.length) return
-        data.forEach(b => {
+        const settlements = data.map(b => {
           const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
           supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
+          return { id: b.id, status: won ? 'won' : 'lost' }
         })
+        setGs(prev => { const next = { ...prev, settlements }; pushMatchState(next); return next })
       })
     }
 
