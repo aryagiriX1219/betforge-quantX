@@ -528,17 +528,20 @@ export function useMatch(currentUser = null, isAdmin = false) {
   }, [])
 
   const adminResolveSetpiece = useCallback(() => {
-    setGs(prev => {
-      if (!prev.setpiece) return prev
-      const { newScore, newEvents, notifMsg, notifType } = processSetpiece(prev.setpiece, prev)
-      const newNotifs = notifMsg
-        ? [{ id: Date.now(), msg: notifMsg, type: notifType, ts: Date.now() }, ...(prev.notifications || [])].slice(0, 80)
-        : prev.notifications || []
-      const next = { ...prev, score: newScore, events: newEvents, setpiece: null, notifications: newNotifs }
-      recalcOdds(next)
-      pushMatchState(next)
-      return next
-    })
+    // CRITICAL FIX: processSetpiece calls setBets(_settleSingle) internally.
+    // Calling setBets inside a setGs updater violates React rules — the inner
+    // setState is silently dropped. Read gs via gsRef, run processSetpiece
+    // outside the updater, then apply the result with setGs.
+    const current = gsRef.current
+    if (!current.setpiece) return
+    const { newScore, newEvents, notifMsg, notifType } = processSetpiece(current.setpiece, current)
+    const newNotifs = notifMsg
+      ? [{ id: Date.now(), msg: notifMsg, type: notifType, ts: Date.now() }, ...(current.notifications || [])].slice(0, 80)
+      : current.notifications || []
+    const next = { ...current, score: newScore, events: newEvents, setpiece: null, notifications: newNotifs }
+    recalcOdds(next)
+    setGs(next)
+    pushMatchState(next)
   }, [processSetpiece, recalcOdds])
 
   const adminInjectEvent = useCallback((ev) => {
