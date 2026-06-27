@@ -184,8 +184,15 @@ export function useMatch(currentUser = null, isAdmin = false) {
   const _settleSingle = useCallback((b, won) => {
     if (won) setBalance(bal => bal + b.stake * b.odds)
     const updated = { ...b, status: won ? 'won' : 'lost' }
-    if (userRef.current) saveBet(userRef.current.id, userRef.current.name, updated)
-    // BUG FIX: update leaderboard immediately after every settlement, not just at FT
+    // CRITICAL FIX: update the bet row directly by its composite id.
+    // Do NOT use saveBet(userRef.current...) — on the admin's machine userRef
+    // is the admin who has no bets. Instead update the row by its known id
+    // so the Supabase realtime subscription on every participant's client fires.
+    supabase.from('bets')
+      .update({ status: updated.status, updated_at: new Date().toISOString() })
+      .eq('id', String(b.id))
+      .then(({ error }) => { if (error) console.error('settle error:', error) })
+    // Also update leaderboard after settlement
     setTimeout(() => {
       const u = userRef.current
       if (!u) return
@@ -199,46 +206,65 @@ export function useMatch(currentUser = null, isAdmin = false) {
   }, [])
 
   // ── Settle all remaining active bets at FT ───────────────────────────────
-  // FIX: Added 'next' market settlement + saveBet on every outcome
+  // CRITICAL FIX: settleBets runs on the admin's machine where betsRef is empty.
+  // Instead of iterating local state, fetch ALL active bets from Supabase,
+  // determine won/lost for each, and update them directly so every participant's
+  // realtime subscription fires and credits their balance.
   const settleBets = useCallback((finalScore, events) => {
+    // Also settle local bets (for the participant who happens to be on this client)
     setBets(prev => prev.map(b => {
       if (b.status !== 'active') return b
       let won = false
-
       if (b.market === 'match') {
         const res = finalScore.P > finalScore.A ? 'por' : finalScore.P < finalScore.A ? 'arg' : 'draw'
         won = b.selection === res
-
       } else if (b.market === 'ou') {
-        won = b.selection === 'over'
-          ? (finalScore.P + finalScore.A) > 2.5
-          : (finalScore.P + finalScore.A) <= 2.5
-
+        won = b.selection === 'over' ? (finalScore.P + finalScore.A) > 2.5 : (finalScore.P + finalScore.A) <= 2.5
       } else if (b.market === 'btts') {
         const both = finalScore.P > 0 && finalScore.A > 0
         won = b.selection === 'yes' ? both : !both
-
       } else if (b.market === 'ah') {
         const res = finalScore.P > finalScore.A ? 'por' : 'arg'
         won = b.selection === res
-
       } else if (b.market === 'scorer') {
         const [team, name] = b.selection.split('_')
         won = events.some(e => e.type === 'goal' && e.team === team && e.scorer === name)
-
       } else if (b.market === 'next') {
-        // FIX Bug 2: Next goal market — find first goal event after bet was placed
         const nextGoal = events.find(e => e.type === 'goal' && (e.ts || 0) > (b.ts || 0))
-        if (nextGoal) {
-          won = b.selection === nextGoal.team
-        } else {
-          // No goal scored after bet — 'none' wins
-          won = b.selection === 'none'
-        }
+        won = nextGoal ? b.selection === nextGoal.team : b.selection === 'none'
       }
-
       return _settleSingle(b, won)
     }))
+
+    // Fetch and settle ALL active bets in Supabase (covers every participant)
+    supabase.from('bets').select('*').eq('status', 'active').then(({ data }) => {
+      if (!data?.length) return
+      data.forEach(b => {
+        let won = false
+        if (b.market === 'match') {
+          const res = finalScore.P > finalScore.A ? 'por' : finalScore.P < finalScore.A ? 'arg' : 'draw'
+          won = b.selection === res
+        } else if (b.market === 'ou') {
+          won = b.selection === 'over' ? (finalScore.P + finalScore.A) > 2.5 : (finalScore.P + finalScore.A) <= 2.5
+        } else if (b.market === 'btts') {
+          const both = finalScore.P > 0 && finalScore.A > 0
+          won = b.selection === 'yes' ? both : !both
+        } else if (b.market === 'ah') {
+          const res = finalScore.P > finalScore.A ? 'por' : 'arg'
+          won = b.selection === res
+        } else if (b.market === 'scorer') {
+          const [team, name] = b.selection.split('_')
+          won = events.some(e => e.type === 'goal' && e.team === team && e.scorer === name)
+        } else if (b.market === 'next') {
+          const nextGoal = events.find(e => e.type === 'goal' && (e.ts || 0) > (b.ts || 0))
+          won = nextGoal ? b.selection === nextGoal.team : b.selection === 'none'
+        }
+        supabase.from('bets')
+          .update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() })
+          .eq('id', b.id)
+          .then(({ error }) => { if (error) console.error('ft settle error:', error) })
+      })
+    })
   }, [_settleSingle])
 
   // ── FIX Bug 3: Save leaderboard with correct post-settlement balance ───────
@@ -282,13 +308,22 @@ export function useMatch(currentUser = null, isAdmin = false) {
       } else {
         notifMsg = `❌ MISS! ${r.taker} blazes it over!`; notifType = 'miss'
       }
-      // FIX Bug 1: settle sp_penalty bets and persist to Supabase
+      // Settle sp_penalty: update local state + ALL users' rows in Supabase
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_penalty' || b.status !== 'active') return b
         const won = b.selection === r.outcome ||
           (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
         return _settleSingle(b, won)
       }))
+      // CRITICAL FIX: fetch all sp_penalty bets from Supabase and settle for all users
+      supabase.from('bets').select('*').eq('market', 'sp_penalty').eq('status', 'active').then(({ data }) => {
+        if (!data?.length) return
+        data.forEach(b => {
+          const won = b.selection === r.outcome ||
+            (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
+          supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
+        })
+      })
 
     } else if (sp.type === 'freekick') {
       const r = resolveFreekick(team, sp.distType, sp.position, fkTakers)
@@ -301,12 +336,19 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const msgs = { saved: `🧤 Free kick saved by ${oppGK}!`, post: `🔔 THE POST! Free kick rattles the bar!`, offtarget: `❌ Free kick off target.`, blocked: `🛡️ Blocked and cleared!` }
         notifMsg = msgs[r.outcome] || `Free kick — ${r.outcome}`; notifType = r.outcome === 'saved' ? 'save' : 'miss'
       }
-      // FIX Bug 1: settle sp_freekick bets and persist to Supabase
+      // Settle sp_freekick: update local + all users in Supabase
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_freekick' || b.status !== 'active') return b
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
         return _settleSingle(b, won)
       }))
+      supabase.from('bets').select('*').eq('market', 'sp_freekick').eq('status', 'active').then(({ data }) => {
+        if (!data?.length) return
+        data.forEach(b => {
+          const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
+          supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
+        })
+      })
 
     } else if (sp.type === 'corner') {
       const r = resolveCorner(team, corTakers)
@@ -319,12 +361,19 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const msgs = { saved: `🧤 Corner saved!`, offtarget: `❌ Corner off target.`, cleared: `🛡️ Corner cleared!` }
         notifMsg = msgs[r.outcome] || `Corner — ${r.outcome}`; notifType = 'tick'
       }
-      // FIX Bug 1: settle sp_corner bets and persist to Supabase
+      // Settle sp_corner: update local + all users in Supabase
       setBets(prev => prev.map(b => {
         if (b.market !== 'sp_corner' || b.status !== 'active') return b
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
         return _settleSingle(b, won)
       }))
+      supabase.from('bets').select('*').eq('market', 'sp_corner').eq('status', 'active').then(({ data }) => {
+        if (!data?.length) return
+        data.forEach(b => {
+          const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
+          supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
+        })
+      })
     }
 
     return { newScore, newEvents: [...state.events, ...(goalEvent ? [goalEvent] : [])], notifMsg, notifType }
