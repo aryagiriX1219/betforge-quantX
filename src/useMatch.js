@@ -49,13 +49,16 @@ async function saveBet(userId, userName, bet) {
   } catch (e) { console.error('bet save error:', e) }
 }
 
-async function saveLeaderboard(userId, userName, balance, wonCount, lostCount, totalSettled) {
+async function saveLeaderboard(userId, userName, balance, wonCount, lostCount, totalBets) {
   try {
+    const pnl = Math.round(balance - INITIAL_BALANCE)
     await supabase.from('leaderboard').upsert({
       user_id: userId, user_name: userName,
       balance: Math.round(balance),
-      pnl: Math.round(balance - INITIAL_BALANCE),
-      bets_count: totalSettled,
+      pnl: pnl,
+      bets_count: totalBets,        // total bets placed (not just settled)
+      bets_won: wonCount,
+      bets_lost: lostCount,
       updated_at: new Date().toISOString(),
     })
   } catch (e) { console.error('lb error:', e) }
@@ -222,7 +225,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
       const wonCount  = allBets.filter(b2 => b2.status === 'won' || (b2.id === updated.id && won)).length
       const lostCount = allBets.filter(b2 => b2.status === 'lost' || (b2.id === updated.id && !won)).length
       const settled   = wonCount + lostCount
-      saveLeaderboard(u.id, u.name, balRef.current, wonCount, lostCount, settled)
+      saveLeaderboard(u.id, u.name, balRef.current, wonCount, lostCount, allBets.length)
     }, 600)
     return updated
   }, [])
@@ -301,8 +304,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
       const allBets    = betsRef.current
       const wonCount   = allBets.filter(b => b.status === 'won').length
       const lostCount  = allBets.filter(b => b.status === 'lost').length
-      const settled    = wonCount + lostCount
-      saveLeaderboard(u.id, u.name, balRef.current, wonCount, lostCount, settled)
+      saveLeaderboard(u.id, u.name, balRef.current, wonCount, lostCount, allBets.length)
     }, 800) // 800ms — enough for React to flush all setBalance calls
   }, [])
 
@@ -521,7 +523,9 @@ export function useMatch(currentUser = null, isAdmin = false) {
       const allBets = [...betsRef.current, bet]
       const wonCount  = allBets.filter(b => b.status === 'won').length
       const lostCount = allBets.filter(b => b.status === 'lost').length
-      saveLeaderboard(currentUser.id, currentUser.name, balRef.current - stake, wonCount, lostCount, wonCount + lostCount)
+      // Use balRef.current - stake as the new balance (state not updated yet)
+      const newBal = balRef.current - stake
+      saveLeaderboard(currentUser.id, currentUser.name, newBal, wonCount, lostCount, allBets.length)
     }
     return true
   }, [stakeInput, pushNotif, currentUser])
