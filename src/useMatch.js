@@ -116,6 +116,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
         event: '*', schema: 'public', table: 'match_state',
         filter: `id=eq.${MATCH_ROW_ID}`,
       }, (payload) => {
+        console.log('MS:', JSON.stringify(payload.new?.state?.settlements))
         const s = payload.new?.state
         if (!s?.score) return
         setGs(s)
@@ -303,6 +304,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
 
   // ── Resolve set piece (admin calls this manually) ─────────────────────────
   const processSetpiece = useCallback((sp, state) => {
+    let settlementPromise = Promise.resolve([])
     const { team } = sp
     const opp   = team === 'portugal' ? 'argentina' : 'portugal'
     const oppGK = TEAMS[opp].players.gk
@@ -335,20 +337,14 @@ export function useMatch(currentUser = null, isAdmin = false) {
           (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
         return _settleSingle(b, won)
       }))
-      // Fetch all sp_penalty bets, settle in Supabase, and broadcast via match_state
-      supabase.from('bets').select('*').eq('market', 'sp_penalty').eq('status', 'active').then(({ data }) => {
-        if (!data?.length) return
-        const settlements = data.map(b => {
+      // Fetch all sp_penalty bets, settle in Supabase, store for broadcast
+      settlementPromise = supabase.from('bets').select('*').eq('market', 'sp_penalty').eq('status', 'active').then(({ data }) => {
+        if (!data?.length) return []
+        return data.map(b => {
           const won = b.selection === r.outcome ||
             (b.selection === 'miss' && (r.outcome === 'miss' || r.outcome === 'post'))
           supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
           return { id: b.id, status: won ? 'won' : 'lost' }
-        })
-        // Broadcast settlements through match_state so every client receives them
-        setGs(prev => {
-          const next = { ...prev, settlements }
-          pushMatchState(next)
-          return next
         })
       })
 
@@ -369,14 +365,13 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
         return _settleSingle(b, won)
       }))
-      supabase.from('bets').select('*').eq('market', 'sp_freekick').eq('status', 'active').then(({ data }) => {
-        if (!data?.length) return
-        const settlements = data.map(b => {
+      settlementPromise = supabase.from('bets').select('*').eq('market', 'sp_freekick').eq('status', 'active').then(({ data }) => {
+        if (!data?.length) return []
+        return data.map(b => {
           const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
           supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
           return { id: b.id, status: won ? 'won' : 'lost' }
         })
-        setGs(prev => { const next = { ...prev, settlements }; pushMatchState(next); return next })
       })
 
     } else if (sp.type === 'corner') {
@@ -396,18 +391,17 @@ export function useMatch(currentUser = null, isAdmin = false) {
         const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
         return _settleSingle(b, won)
       }))
-      supabase.from('bets').select('*').eq('market', 'sp_corner').eq('status', 'active').then(({ data }) => {
-        if (!data?.length) return
-        const settlements = data.map(b => {
+      settlementPromise = supabase.from('bets').select('*').eq('market', 'sp_corner').eq('status', 'active').then(({ data }) => {
+        if (!data?.length) return []
+        return data.map(b => {
           const won = (b.selection === 'goal' && scored) || b.selection === r.outcome
           supabase.from('bets').update({ status: won ? 'won' : 'lost', updated_at: new Date().toISOString() }).eq('id', b.id).then()
           return { id: b.id, status: won ? 'won' : 'lost' }
         })
-        setGs(prev => { const next = { ...prev, settlements }; pushMatchState(next); return next })
       })
     }
 
-    return { newScore, newEvents: [...state.events, ...(goalEvent ? [goalEvent] : [])], notifMsg, notifType }
+    return { newScore, newEvents: [...state.events, ...(goalEvent ? [goalEvent] : [])], notifMsg, notifType, settlementPromise }
   }, [_settleSingle])
 
   // ── Admin tick engine ─────────────────────────────────────────────────────
@@ -608,20 +602,25 @@ export function useMatch(currentUser = null, isAdmin = false) {
   }, [])
 
   const adminResolveSetpiece = useCallback(() => {
-    // CRITICAL FIX: processSetpiece calls setBets(_settleSingle) internally.
-    // Calling setBets inside a setGs updater violates React rules — the inner
-    // setState is silently dropped. Read gs via gsRef, run processSetpiece
-    // outside the updater, then apply the result with setGs.
     const current = gsRef.current
     if (!current.setpiece) return
-    const { newScore, newEvents, notifMsg, notifType } = processSetpiece(current.setpiece, current)
+    const { newScore, newEvents, notifMsg, notifType, settlementPromise } = processSetpiece(current.setpiece, current)
     const newNotifs = notifMsg
       ? [{ id: Date.now(), msg: notifMsg, type: notifType, ts: Date.now() }, ...(current.notifications || [])].slice(0, 80)
       : current.notifications || []
-    const next = { ...current, score: newScore, events: newEvents, setpiece: null, notifications: newNotifs }
-    recalcOdds(next)
-    setGs(next)
-    pushMatchState(next)
+    // Push base state immediately (score, events, notifications)
+    const base = { ...current, score: newScore, events: newEvents, setpiece: null, notifications: newNotifs, settlements: [] }
+    recalcOdds(base)
+    setGs(base)
+    pushMatchState(base)
+    // Once Supabase returns settled bets, push a second update with settlements
+    // so every client's match_state handler applies won/lost to local bets
+    settlementPromise.then(settlements => {
+      if (!settlements?.length) return
+      const withSettlements = { ...base, settlements }
+      setGs(withSettlements)
+      pushMatchState(withSettlements)
+    })
   }, [processSetpiece, recalcOdds])
 
   const adminInjectEvent = useCallback((ev) => {
