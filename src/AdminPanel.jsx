@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { TEAMS, ADMIN_PASSWORD } from './constants'
 import { fmt } from './math'
 import { supabase } from './supabase'
@@ -90,6 +90,15 @@ export function AdminPanel({
     } catch (e) { console.error(e) }
     setLbLoading(false)
   }
+
+  // ── Auto-load leaderboard on mount + refresh every 10s during match ────────
+  const intervalRef = useRef(null)
+  useEffect(() => {
+    if (!authed) return
+    loadLB() // load immediately when admin panel opens
+    intervalRef.current = setInterval(loadLB, 10000) // refresh every 10s
+    return () => clearInterval(intervalRef.current)
+  }, [authed]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Export summary CSV ───────────────────────────────────────────────────
   const exportSummaryCSV = () => {
@@ -449,7 +458,7 @@ export function AdminPanel({
 
           {lb.length === 0 && !lbLoading && (
             <div style={{ fontSize: 11, color: '#3a5a3a', padding: '12px 0' }}>
-              No data yet. Participants save their scores when a match ends. Click REFRESH after the match.
+              No participants yet. Leaderboard updates every 10s automatically.
             </div>
           )}
 
