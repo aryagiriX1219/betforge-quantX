@@ -105,8 +105,8 @@ export function AdminPanel({
     if (!lb.length) return
     const rows = [['Rank','Name','Balance','P&L','Total Bets','Won','Lost','Active','Best Return (coins)']]
     lb.forEach(e => {
-      const won    = e.bets.filter(b => b.status === 'won').length
-      const lost   = e.bets.filter(b => b.status === 'lost').length
+      const won    = e.bets_won  ?? e.bets.filter(b => b.status === 'won').length
+      const lost   = e.bets_lost ?? e.bets.filter(b => b.status === 'lost').length
       const active = e.bets.filter(b => b.status === 'active').length
       const best   = e.bets.filter(b => b.status === 'won').reduce((m, b) => Math.max(m, b.stake * b.odds), 0)
       rows.push([e.rank, e.user_name, e.balance, e.pnl >= 0 ? `+${e.pnl}` : e.pnl, e.bets_count, won, lost, active, best.toFixed(0)])
@@ -474,8 +474,8 @@ export function AdminPanel({
                 </thead>
                 <tbody>
                   {lb.map((e, i) => {
-                    const won    = e.bets.filter(b => b.status === 'won').length
-                    const lost   = e.bets.filter(b => b.status === 'lost').length
+                    const won    = e.bets_won  ?? e.bets.filter(b => b.status === 'won').length
+                    const lost   = e.bets_lost ?? e.bets.filter(b => b.status === 'lost').length
                     const active = e.bets.filter(b => b.status === 'active').length
                     const best   = e.bets.filter(b => b.status === 'won').reduce((m, b) => Math.max(m, b.stake * b.odds), 0)
                     const medal  = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`
