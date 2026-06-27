@@ -445,7 +445,7 @@ export function useMatch(currentUser = null, isAdmin = false) {
       let ns = { ...prev.score }, ne = [...prev.events]
       let nlP = prev.lambdaP, nlA = prev.lambdaA
       let nRC = { ...prev.redCards }, nYC = { ...prev.yellowCards }
-      const events = sim.type === 'normal' ? sim.events : []
+      const events = [] // ALL events admin-triggered only
 
       for (const ev of events) {
         if (ev.type === 'goal') {
