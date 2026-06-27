@@ -1,3 +1,4 @@
+import React, { useState, useEffect } from 'react'
 import { fmt } from './math'
 import { TEAMS, SCORER_MARKET, INITIAL_BALANCE } from './constants'
 
@@ -341,9 +342,22 @@ export function BetSlip({ betSlip, stakeInput, setStakeInput, onPlace, onClose }
 // ─── SET PIECE OVERLAY ────────────────────────────────────────────────────────
 
 export function SetPieceOverlay({ setpiece, spTimer, stakeInput, setStakeInput, onBet }) {
+  const [selected, setSelected] = useState(null)
+
+  // Reset selection when a new set piece appears
+  useEffect(() => { setSelected(null) }, [setpiece?.market, setpiece?.type])
+
   if (!setpiece) return null
   const timerPct = (spTimer / (setpiece.timerSec || 20)) * 100
   const urgent   = spTimer <= 5
+  const betPlaced = selected !== null
+  const canBet    = !betPlaced && spTimer > 0
+
+  const handleBet = (market, key, odds) => {
+    if (!canBet) return
+    const success = onBet(market, key, odds, 300)
+    if (success !== false) setSelected(key)
+  }
 
   return (
     <div style={{
@@ -384,34 +398,46 @@ export function SetPieceOverlay({ setpiece, spTimer, stakeInput, setStakeInput, 
           </div>
         )}
 
-        {/* Options */}
+        {/* Bet placed confirmation */}
+        {betPlaced && (
+          <div style={{ marginBottom: 12, padding: '8px 16px', background: '#0d2a0d', border: '1px solid #4eff91', borderRadius: 3, fontSize: 12, color: '#4eff91', fontWeight: 700 }}>
+            ✅ BET PLACED — {selected.toUpperCase()} · Waiting for result...
+          </div>
+        )}
+
+        {/* Options — disabled after one bet placed */}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap', marginBottom: 24 }}>
-          {setpiece.spOptions?.map(opt => (
-            <button
-              key={opt.key}
-              onClick={() => onBet(setpiece.market, opt.key, opt.odds, 300)}
-              style={{
-                background: '#0d200d',
-                border: '1px solid #c8ff00',
-                color: '#c8ff00',
-                fontFamily: 'inherit',
-                padding: '10px 16px',
-                borderRadius: 3,
-                minWidth: 100,
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                gap: 4,
-                cursor: 'pointer',
-                transition: 'background 0.15s',
-              }}
-              onMouseEnter={e => e.currentTarget.style.background = '#152a15'}
-              onMouseLeave={e => e.currentTarget.style.background = '#0d200d'}
-            >
-              <span style={{ fontSize: 12 }}>{opt.label}</span>
-              <span style={{ fontSize: 20, fontWeight: 700 }}>{fmt(opt.odds)}</span>
-            </button>
-          ))}
+          {setpiece.spOptions?.map(opt => {
+            const isChosen = selected === opt.key
+            const isDisabled = betPlaced && !isChosen
+            return (
+              <button
+                key={opt.key}
+                onClick={() => handleBet(setpiece.market, opt.key, opt.odds)}
+                disabled={!canBet}
+                style={{
+                  background: isChosen ? '#0d400d' : isDisabled ? '#0a100a' : '#0d200d',
+                  border: `1px solid ${isChosen ? '#4eff91' : isDisabled ? '#1a2a1a' : '#c8ff00'}`,
+                  color: isChosen ? '#4eff91' : isDisabled ? '#2a4a2a' : '#c8ff00',
+                  fontFamily: 'inherit',
+                  padding: '10px 16px',
+                  borderRadius: 3,
+                  minWidth: 100,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  gap: 4,
+                  cursor: canBet ? 'pointer' : 'not-allowed',
+                  opacity: isDisabled ? 0.4 : 1,
+                  transition: 'all 0.15s',
+                }}
+              >
+                <span style={{ fontSize: 12 }}>{opt.label}</span>
+                <span style={{ fontSize: 20, fontWeight: 700 }}>{fmt(opt.odds)}</span>
+                {isChosen && <span style={{ fontSize: 9, color: '#4eff91' }}>✓ YOUR BET</span>}
+              </button>
+            )
+          })}
         </div>
 
         {/* Stake input */}
