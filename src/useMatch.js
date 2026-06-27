@@ -34,8 +34,14 @@ async function pushMatchState(state) {
 
 async function saveBet(userId, userName, bet) {
   try {
+    // BUG FIX: bet.id may already be the composite "userId_localId" string (when
+    // loaded from Supabase), or it may be a plain numeric local id (freshly placed).
+    // Avoid double-prefixing by checking whether the id already starts with userId.
+    const compositeId = String(bet.id).startsWith(`${userId}_`)
+      ? String(bet.id)
+      : `${userId}_${bet.id}`
     await supabase.from('bets').upsert({
-      id: `${userId}_${bet.id}`, user_id: userId, user_name: userName,
+      id: compositeId, user_id: userId, user_name: userName,
       market: bet.market, selection: bet.selection, stake: bet.stake,
       odds: bet.odds, status: bet.status, potential: bet.stake * bet.odds,
       updated_at: new Date().toISOString(),
@@ -133,9 +139,16 @@ export function useMatch(currentUser = null, isAdmin = false) {
           ts: b.ts || 0,
           label: `${b.market.toUpperCase()} — ${b.selection}`,
         })))
-        const won   = data.filter(b => b.status === 'won').reduce((s, b) => s + b.stake * b.odds, 0)
-        const spent = data.filter(b => b.status !== 'void').reduce((s, b) => s + b.stake, 0)
-        setBalance(INITIAL_BALANCE - spent + won)
+        // BUG FIX: rebuild balance only from settled bets so a mid-game
+        // reconnect never overwrites a balance that already includes live winnings.
+        // Formula: start + sum(won payouts) - sum(all non-void stakes)
+        const nonVoid = data.filter(b => b.status !== 'void')
+        const spent   = nonVoid.reduce((s, b) => s + b.stake, 0)
+        const won     = data.filter(b => b.status === 'won').reduce((s, b) => s + b.stake * b.odds, 0)
+        const rebuilt = INITIAL_BALANCE - spent + won
+        // Only apply if balance hasn't been touched yet (still at initial value)
+        // to avoid overwriting a live-credited balance on reconnect.
+        setBalance(cur => cur === INITIAL_BALANCE ? rebuilt : Math.max(cur, rebuilt))
       })
   }, [currentUser])
 
@@ -145,6 +158,16 @@ export function useMatch(currentUser = null, isAdmin = false) {
     if (won) setBalance(bal => bal + b.stake * b.odds)
     const updated = { ...b, status: won ? 'won' : 'lost' }
     if (userRef.current) saveBet(userRef.current.id, userRef.current.name, updated)
+    // BUG FIX: update leaderboard immediately after every settlement, not just at FT
+    setTimeout(() => {
+      const u = userRef.current
+      if (!u) return
+      const allBets   = betsRef.current
+      const wonCount  = allBets.filter(b2 => b2.status === 'won' || (b2.id === updated.id && won)).length
+      const lostCount = allBets.filter(b2 => b2.status === 'lost' || (b2.id === updated.id && !won)).length
+      const settled   = wonCount + lostCount
+      saveLeaderboard(u.id, u.name, balRef.current, wonCount, lostCount, settled)
+    }, 600)
     return updated
   }, [])
 
