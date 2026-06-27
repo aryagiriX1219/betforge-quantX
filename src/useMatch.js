@@ -116,7 +116,6 @@ export function useMatch(currentUser = null, isAdmin = false) {
         event: '*', schema: 'public', table: 'match_state',
         filter: `id=eq.${MATCH_ROW_ID}`,
       }, (payload) => {
-        console.log('MS:', JSON.stringify(payload.new?.state?.settlements))
         const s = payload.new?.state
         if (!s?.score) return
         setGs(s)
@@ -129,7 +128,12 @@ export function useMatch(currentUser = null, isAdmin = false) {
           setBets(prev => {
             let anyChange = false
             const next = prev.map(b => {
-              const hit = s.settlements.find(sv => sv.id === b.id)
+              // Match by composite id ("462_21") OR by the suffix after "_" (plain local id "21")
+              const bIdStr = String(b.id)
+              const hit = s.settlements.find(sv => {
+                const svId = String(sv.id)
+                return svId === bIdStr || svId.endsWith(`_${bIdStr}`)
+              })
               if (!hit || b.status === hit.status) return b
               anyChange = true
               if (hit.status === 'won') setBalance(bal => bal + b.stake * b.odds)
