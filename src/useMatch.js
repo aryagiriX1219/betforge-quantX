@@ -127,6 +127,33 @@ export function useMatch(currentUser = null, isAdmin = false) {
     return () => supabase.removeChannel(channel)
   }, [recalcOdds])
 
+  // ── Supabase realtime: sync bet settlements to participants ───────────────
+  // Bets table realtime must be enabled in Supabase dashboard.
+  // When admin resolves a set piece, saveBet writes won/lost to Supabase.
+  // This subscription picks that up and updates local state + balance instantly.
+  useEffect(() => {
+    if (!currentUser) return
+    const betChannel = supabase
+      .channel(`bets_${currentUser.id}`)
+      .on('postgres_changes', {
+        event: 'UPDATE', schema: 'public', table: 'bets',
+        filter: `user_id=eq.${currentUser.id}`,
+      }, (payload) => {
+        const updated = payload.new
+        if (!updated?.id) return
+        setBets(prev => prev.map(b => {
+          if (b.id !== updated.id) return b
+          if (b.status === updated.status) return b // already applied locally
+          if (updated.status === 'won') {
+            setBalance(bal => bal + updated.stake * updated.odds)
+          }
+          return { ...b, status: updated.status }
+        }))
+      })
+      .subscribe()
+    return () => supabase.removeChannel(betChannel)
+  }, [currentUser])
+
   // ── Load user's bets from Supabase on login ───────────────────────────────
   useEffect(() => {
     if (!currentUser) return
